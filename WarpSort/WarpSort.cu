@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include <math.h>
 
 #include "../utils/common.h"
 
@@ -52,26 +53,60 @@ __global__ void bitonic_sort_step(int *a, int j, int k) {
 }
 
 /*
-__global__ void bitonic_sort_warp(int *keyin, int k_0, int k_1){
+__global__ void bitonic_sort_warp(int *keyin){
   //prendere thread id giusto tenendo in considerazione k_0 e k_1
   //implementare gli swap fatti bene dentro la funzione
+  unsigned int id = threadIdx.x + blockDim.x * blockIdx.x;
+  unsigned int subseq = id / 32; //in quale sottosequenza dell'array siamo
+  unsigned int start = 128 * subseq; //primo elemento della sottosequenza da riordinare
 
   int i,j = 0;
+  int phase, stage = 0;
 
   //phase 0 to log(128)-1 
   for(i=2;i<128;i*=2){ 
-    for(j=i/2;j>0;j/=2){ 
+    stage = 0;
+
+    int dim = i*2;
+    int u =(int)ceil(((threadId.x+1)*4/dim)); //indice della sottosequenza simmetrica 
+
+    int index1 = (u - 1) * dim;
+    int index2 = index1 + dim - 1;
+
+    for(j = i/2; j > 0; j /= 2){ 
+        
+      int p = 0; // posizione del thread nella sottosequenza simmetrica
+
+      int q; //
+
+      if (stage == 0) {
+          q = p;
+      }
+      if (stage != ultimo stage){
+          //cose
+      }
+      if (stage == ultimo stage){
+          altre cose
+      }
+      k_0 = index1 + q;
+      k_1 = index2 - q; 
+
+      k_0 = start + k_0;
+      k_1 = start + k_1; 
+      
       //k_0 ? position of preceding element in each pair to form ascending order
-      if(keyin[k_0]>keyin[k_0+j]) 
+      if(keyin[k_0] > keyin[k_0+j]) 
         swap(keyin[k_0],keyin[k_0+j]);
       //k1 ? position of preceding element in each pair to form descending order
-      if(keyin[k_1]<keyin[k_1+j]) 
+      if(keyin[k_1] < keyin[k_1+j]) 
         swap(keyin[k_1],keyin[k_1+j]);
+      stage++;
     }
+    phase++;
   }
 
   //special case for the last phase 
-  for(j=128/2;j>0;j/=2){ 
+  for(j=128/2; j>0; j/=2){ 
     //k0 ? position of preceding element in the thread's first pair to form ascending order
     if(keyin[k_0]>keyin[k_0+j]) 
       swap(keyin[k_0],keyin[k_0+j]);
