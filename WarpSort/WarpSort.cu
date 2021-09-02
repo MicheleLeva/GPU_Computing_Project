@@ -4,8 +4,8 @@
 
 #include "../utils/common.h"
 
-#define THREADS 16
-#define BLOCKS 1
+#define THREADS 128
+#define BLOCKS 2
 
 
 /*
@@ -51,11 +51,13 @@ __global__ void bitonic_sort_step(int *a, int j, int k) {
 	}
 }
 
-__global__ void bitonic_sort_warp(int *keyin){
+/*
+__global__ void bitonic_sort_warp(int *keyin, int k_0, int k_1){
   //prendere thread id giusto tenendo in considerazione k_0 e k_1
   //implementare gli swap fatti bene dentro la funzione
 
-  int i,j,k_0,k_1 = 0;
+  int i,j = 0;
+
   //phase 0 to log(128)-1 
   for(i=2;i<128;i*=2){ 
     for(j=i/2;j>0;j/=2){ 
@@ -77,7 +79,7 @@ __global__ void bitonic_sort_warp(int *keyin){
     if(keyin[k_1]>keyin[k_1+j]) 
       swap(keyin[k_1],keyin[k_1+j]);
   }
-}
+}*/
 
 /*The parameter dir indicates the sorting direction, ASCENDING
  or DESCENDING; if (a[i] > a[j]) agrees with the direction,
@@ -143,13 +145,16 @@ int main(void) {
 
 	// fill data
 	for (int i = 0; i < N; ++i) {
-		a[i] =  i%5; //rand() % 100; // / (float) RAND_MAX;
+		//a[i] =  i%5; //rand() % 100; // / (float) RAND_MAX;
+    a[i] = rand() % 100;
 		b[i] = a[i];
 	}
 
 	// bitonic CPU
 	double cpu_time = seconds();
-	bitonicSort(b, 0, N, 1);   // 1 means sort in ascending order
+
+  bitonicSort(b, 0, N, 1);   // 1 means sort in ascending order
+
 	printf("CPU elapsed time: %.5f (sec)\n", seconds()-cpu_time);
 
 	// device mem copy
@@ -164,16 +169,18 @@ int main(void) {
 	// start computation
 	cudaEventRecord(start);
 	int j, k;
-	// external loop on comparators of size k
-	for (k = 2; k <= N; k <<= 1) {
-		// internal loop for comparator internal stages
-		for (j = k >> 1; j > 0; j = j >> 1)
-			bitonic_sort_step<<<blocks, threads>>>(d_a, j, k);
-	}
+  // external loop on comparators of size k
+  for (k = 2; k <= N; k <<= 1) {
+    // internal loop for comparator internal stages
+    for (j = k >> 1; j > 0; j = j >> 1)
+      bitonic_sort_step<<<blocks, threads>>>(d_a, j, k);
+  }
+
+	
 
   /*Divide the input sequence into equal-sized subsequences. 
   Each subsequence will be sorted by an independent warp using the bitonic network.*/
-  bitonic_sort_warp<<<blocks, threads>>>(d_a);
+  //bitonic_sort_warp<<<blocks, threads>>>(d_a);
 
 	cudaEventRecord(stop);
 	cudaEventSynchronize(stop);
@@ -185,7 +192,7 @@ int main(void) {
 	cudaMemcpy(a, d_a, nBytes, cudaMemcpyDeviceToHost);
 
 	// print & check
-	if (N < 100) {
+	if (N < 500) {
 		printf("GPU:\n");
 		for (int i = 0; i < N; ++i)
 			printf("%d\n", a[i]);
