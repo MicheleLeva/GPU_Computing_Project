@@ -6,7 +6,7 @@
 #include "../utils/common.h"
 
 #define THREADS 128
-#define BLOCKS 2
+#define BLOCKS 1
 
 
 /*
@@ -52,7 +52,7 @@ __global__ void bitonic_sort_step(int *a, int j, int k) {
 	}
 }
 
-/*
+
 __global__ void bitonic_sort_warp(int *keyin){
   //prendere thread id giusto tenendo in considerazione k_0 e k_1
   //implementare gli swap fatti bene dentro la funzione
@@ -60,33 +60,47 @@ __global__ void bitonic_sort_warp(int *keyin){
   unsigned int subseq = id / 32; //in quale sottosequenza dell'array siamo
   unsigned int start = 128 * subseq; //primo elemento della sottosequenza da riordinare
 
-  int i,j = 0;
-  int phase, stage = 0;
+  int i = 0,j = 0;
+  int phase = 0, stage = 0;
+  int k_0 = 0, k_1 = 0;
+  float dim = 0;
 
   //phase 0 to log(128)-1 
-  for(i=2;i<128;i*=2){ 
+  for(i=2; i<128 ;i*=2){ 
     stage = 0;
 
-    int dim = i*2;
-    int u =(int)ceil(((threadId.x+1)*4/dim)); //indice della sottosequenza simmetrica 
+
+    dim = i*2;
+    int u = ceil( (threadIdx.x+1) * (4/dim) ); //indice della sottosequenza simmetrica a cui il thread appartiene
+    //printf("thread %d : u = %d \n", threadIdx.x, u);
 
     int index1 = (u - 1) * dim;
     int index2 = index1 + dim - 1;
 
     for(j = i/2; j > 0; j /= 2){ 
-        
-      int p = 0; // posizione del thread nella sottosequenza simmetrica
+      if (threadIdx.x == 0)
+        printf("thread %d : phase = %d, stage = %d \n", threadIdx.x, phase, stage);
+      int p = threadIdx.x - (u - 1) * (dim / 4); // posizione del thread nella sottosequenza simmetrica
+      //printf("thread %d : p = %d \n", threadIdx.x, p);
 
-      int q; //
+      int q; //offset usato poi per k_0 e k_1
 
-      if (stage == 0) {
+      if (stage == 0) { // primo stage della fase
           q = p;
       }
-      if (stage != ultimo stage){
-          //cose
+      if (stage != 0 && stage != phase){ //né primo né ultimo stage della fase
+          
+          //int n = 2 ^ stage; // numero di minisequenze
+          int m = j; // numero di freccie rosse per minisequenza
+          int o = j * 2; //offset speciale tra minisequenza e l'altra
+
+          int um = floor(p / m); //indice della minisequenza a cui il thread appartiene
+
+          int pm = p - um * m; //posizione del thread nella minisequenza
+          q = pm + o * um;
       }
-      if (stage == ultimo stage){
-          altre cose
+      if (stage == phase){ //ultimo stage della fase
+          q = p * 2;
       }
       k_0 = index1 + q;
       k_1 = index2 - q; 
@@ -94,27 +108,47 @@ __global__ void bitonic_sort_warp(int *keyin){
       k_0 = start + k_0;
       k_1 = start + k_1; 
       
+      printf("thread %d : k_0 = %d, k_1 = %d \n", threadIdx.x, k_0, k_1);
+
       //k_0 ? position of preceding element in each pair to form ascending order
-      if(keyin[k_0] > keyin[k_0+j]) 
-        swap(keyin[k_0],keyin[k_0+j]);
+      if(keyin[k_0] > keyin[k_0+j]) {
+        int tmp = keyin[k_0];
+        keyin[k_0] = keyin[k_0+j];
+        keyin[k_0+j] = tmp;
+      }
       //k1 ? position of preceding element in each pair to form descending order
-      if(keyin[k_1] < keyin[k_1+j]) 
-        swap(keyin[k_1],keyin[k_1+j]);
+      if(keyin[k_1] > keyin[k_1-j]){
+        int tmp = keyin[k_1];
+        keyin[k_1] = keyin[k_1-j];
+        keyin[k_1-j] = tmp;
+      }
+
       stage++;
     }
     phase++;
   }
 
+  /*
   //special case for the last phase 
-  for(j=128/2; j>0; j/=2){ 
+  for(j=128/2; j>0; j/=2){
+      
     //k0 ? position of preceding element in the thread's first pair to form ascending order
-    if(keyin[k_0]>keyin[k_0+j]) 
-      swap(keyin[k_0],keyin[k_0+j]);
+    if(keyin[k_0] > keyin[k_0+j]){
+        int tmp = keyin[k_0];
+        keyin[k_0] = keyin[k_0+j];
+        keyin[k_0+j] = tmp;
+    }
+
     //k1 ? position of preceding element in the thread's second pair to form ascending order
-    if(keyin[k_1]>keyin[k_1+j]) 
-      swap(keyin[k_1],keyin[k_1+j]);
-  }
-}*/
+    if(keyin[k_1] > keyin[k_1-j]){
+        int tmp = keyin[k_1];
+        keyin[k_1] = keyin[k_1-j];
+        keyin[k_1-j] = tmp;
+    }
+  }*/
+  
+
+}
 
 /*The parameter dir indicates the sorting direction, ASCENDING
  or DESCENDING; if (a[i] > a[j]) agrees with the direction,
@@ -199,10 +233,11 @@ int main(void) {
 
 	// num of threads
 	dim3 blocks(BLOCKS, 1);   // Number of blocks
-	dim3 threads(THREADS, 1); // Number of threads
-
+	//dim3 threads(THREADS, 1); // Number of threads
+  dim3 threads(THREADS / 4, 1); // Number of threads
 	// start computation
 	cudaEventRecord(start);
+  /*
 	int j, k;
   // external loop on comparators of size k
   for (k = 2; k <= N; k <<= 1) {
@@ -210,12 +245,12 @@ int main(void) {
     for (j = k >> 1; j > 0; j = j >> 1)
       bitonic_sort_step<<<blocks, threads>>>(d_a, j, k);
   }
-
+  */
 	
 
   /*Divide the input sequence into equal-sized subsequences. 
   Each subsequence will be sorted by an independent warp using the bitonic network.*/
-  //bitonic_sort_warp<<<blocks, threads>>>(d_a);
+  bitonic_sort_warp<<<blocks, threads>>>(d_a);
 
 	cudaEventRecord(stop);
 	cudaEventSynchronize(stop);
@@ -231,9 +266,11 @@ int main(void) {
 		printf("GPU:\n");
 		for (int i = 0; i < N; ++i)
 			printf("%d\n", a[i]);
+      /*
 		printf("CPU:\n");
 		for (int i = 0; i < N; ++i)
 			printf("%d\n", b[i]);
+      */
 	}
 	else {
 		for (int i = 0; i < N; ++i) {
