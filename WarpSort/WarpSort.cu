@@ -7,6 +7,81 @@
 
 #define THREADS 128
 #define BLOCKS 8
+#define T 64
+
+//Merge all the subsequences produced in step 1 until the parallelism is insufficient.
+__device__ void bitonic_warp_merge(int * keyin){
+  
+  int i = 0, j = 0;
+  int stage = 0;
+  int k_0 = 0;
+  int u = 0, index1 = 0, index2 = 0, p = 0, q = 0;
+  float dim = 0;
+
+  __shared__ int buffer[T];
+  __shared__ int tempout[T*2];
+
+  unsigned int id = threadIdx.x + blockDim.x * blockIdx.x;
+  unsigned int subseq = id / 32; //in quale sottosequenza dell'array siamo
+  unsigned int start = THREADS * subseq; //primo elemento della sottosequenza da riordinare
+
+  int numSmallSubsequences = THREADS*2 / T;
+  int iA = start, iB = start + THREADS;
+  bool compare;
+  
+  //prendo prima sequenza di A e la metto sul buffer
+  for (iA = start; iA < T/2; i++)
+    buffer[iA] = keyin[start + iA];
+
+  //prendo prima sequenza di B e la metto sul buffer
+  for (iB = start + THREADS; iB < T/2; i++)
+    buffer[iB] = keyin[start + iB];
+
+  compare = buffer[iA] > buffer[iB];
+
+  for(i = 0; i < numSmallSubsequences - 1; i++){
+    
+    stage = 0;
+    //bitonic based merge sort
+    for(j = T/2; j>0; j/=2){
+      
+      dim = j * 2;
+      if (dim < 4) dim = 4;
+      u = ceil( (threadIdx.x+1) * (4/dim) ); //indice della sottosequenza simmetrica a cui il thread appartiene
+
+      //printf("thread %d : u = %d \n", threadIdx.x, u);
+
+      index1 = (u - 1) * dim;
+      index2 = index1 + dim - 1;
+
+      p = threadIdx.x - (u - 1) * (dim / 4); // posizione del thread nella sottosequenza simmetrica
+
+      //q è l'offset usato poi per k_0 e k_1
+      
+      q = p;
+          
+      k_0 = index1 + q;
+
+      /*
+      if (threadIdx.x == 0)
+          printf("thread %d : stage = %d, offset = %d \n", threadIdx.x, stage, j);
+      printf("thread %d : k_0 = %d, k_1 = %d \n", threadIdx.x, k_0, k_1);
+      */
+        
+      //k0 ? position of preceding element in the thread's first pair to form ascending order
+      if(buffer[k_0] > buffer[k_0+j]){
+          int tmp = buffer[k_0];
+          buffer[k_0] = buffer[k_0 + j];
+          buffer[k_0 + j] = tmp;
+      }
+
+      stage++;
+    }
+  }
+
+  
+
+}
 
 /*Divide the input sequence into equal-sized subsequences. 
   Each subsequence will be sorted by an independent warp using the bitonic network.*/
@@ -17,7 +92,7 @@ __global__ void bitonic_sort_warp(int *keyin){
   unsigned int subseq = id / 32; //in quale sottosequenza dell'array siamo
   unsigned int start = 128 * subseq; //primo elemento della sottosequenza da riordinare
 
-  int i = 0,j = 0;
+  int i = 0, j = 0;
   int phase = 0, stage = 0;
   int k_0 = 0, k_1 = 0;
   int u = 0, index1 = 0, index2 = 0, p = 0, q = 0, m = 0, o = 0, um = 0, pm = 0;
@@ -134,8 +209,9 @@ __global__ void bitonic_sort_warp(int *keyin){
 
     stage++;
   }
-  
 }
+
+
 
 /*The parameter dir indicates the sorting direction, ASCENDING
  or DESCENDING; if (a[i] > a[j]) agrees with the direction,
