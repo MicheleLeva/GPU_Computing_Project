@@ -52,6 +52,13 @@ __global__ void bitonic_sort_step(int *a, int j, int k) {
 	}
 }
 
+__device__ int GPUceil(float num) {
+    int inum = (int)num;
+    if (num == (float)inum) {
+        return inum;
+    }
+    return inum + 1;
+}
 
 __global__ void bitonic_sort_warp(int *keyin){
   //prendere thread id giusto tenendo in considerazione k_0 e k_1
@@ -63,6 +70,7 @@ __global__ void bitonic_sort_warp(int *keyin){
   int i = 0,j = 0;
   int phase = 0, stage = 0;
   int k_0 = 0, k_1 = 0;
+  int u = 0, index1 = 0, index2 = 0, p = 0, q = 0, m = 0, o = 0, um = 0, pm = 0;
   float dim = 0;
 
   //phase 0 to log(128)-1 
@@ -71,19 +79,21 @@ __global__ void bitonic_sort_warp(int *keyin){
 
 
     dim = i*2;
-    int u = ceil( (threadIdx.x+1) * (4/dim) ); //indice della sottosequenza simmetrica a cui il thread appartiene
+    u = GPUceil( (threadIdx.x+1) * (4/dim) ); //indice della sottosequenza simmetrica a cui il thread appartiene
     //printf("thread %d : u = %d \n", threadIdx.x, u);
 
-    int index1 = (u - 1) * dim;
-    int index2 = index1 + dim - 1;
+    index1 = (u - 1) * dim;
+    index2 = index1 + dim - 1;
 
     for(j = i/2; j > 0; j /= 2){ 
+      /*
       if (threadIdx.x == 0)
         printf("thread %d : phase = %d, stage = %d \n", threadIdx.x, phase, stage);
-      int p = threadIdx.x - (u - 1) * (dim / 4); // posizione del thread nella sottosequenza simmetrica
+      */
+      p = threadIdx.x - (u - 1) * (dim / 4); // posizione del thread nella sottosequenza simmetrica
       //printf("thread %d : p = %d \n", threadIdx.x, p);
 
-      int q; //offset usato poi per k_0 e k_1
+      //q è l'offset usato poi per k_0 e k_1
 
       if (stage == 0) { // primo stage della fase
           q = p;
@@ -91,12 +101,12 @@ __global__ void bitonic_sort_warp(int *keyin){
       if (stage != 0 && stage != phase){ //né primo né ultimo stage della fase
           
           //int n = 2 ^ stage; // numero di minisequenze
-          int m = j; // numero di freccie rosse per minisequenza
-          int o = j * 2; //offset speciale tra minisequenza e l'altra
+          m = j; // numero di freccie rosse per minisequenza
+          o = j * 2; //offset speciale tra minisequenza e l'altra
 
-          int um = floor(p / m); //indice della minisequenza a cui il thread appartiene
+          um = (int)(p / m); //indice della minisequenza a cui il thread appartiene
 
-          int pm = p - um * m; //posizione del thread nella minisequenza
+          pm = p - um * m; //posizione del thread nella minisequenza
           q = pm + o * um;
       }
       if (stage == phase){ //ultimo stage della fase
@@ -108,7 +118,7 @@ __global__ void bitonic_sort_warp(int *keyin){
       k_0 = start + k_0;
       k_1 = start + k_1; 
       
-      printf("thread %d : k_0 = %d, k_1 = %d \n", threadIdx.x, k_0, k_1);
+      //printf("thread %d : k_0 = %d, k_1 = %d \n", threadIdx.x, k_0, k_1);
 
       //k_0 ? position of preceding element in each pair to form ascending order
       if(keyin[k_0] > keyin[k_0+j]) {
@@ -128,26 +138,70 @@ __global__ void bitonic_sort_warp(int *keyin){
     phase++;
   }
 
-  /*
+  stage = 0;
   //special case for the last phase 
   for(j=128/2; j>0; j/=2){
+    
+    dim = j * 2;
+    if (dim < 4) dim = 4;
+    u = GPUceil( (threadIdx.x+1) * (4/dim) ); //indice della sottosequenza simmetrica a cui il thread appartiene
+
+    //printf("thread %d : u = %d \n", threadIdx.x, u);
+
+    index1 = (u - 1) * dim;
+    index2 = index1 + dim - 1;
+
+    p = threadIdx.x - (u - 1) * (dim / 4); // posizione del thread nella sottosequenza simmetrica
+
+    //q è l'offset usato poi per k_0 e k_1
+    
+    q = p;
+    /*
+    if (stage == 0) { // primo stage della fase
+          q = p;
+    }
+    if (stage != 0 && stage != 6){
+    m = j; // numero di freccie rosse per minisequenza
+    o = j * 2; //offset speciale tra minisequenza e l'altra
+
+    um = (int)(p / m); //indice della minisequenza a cui il thread appartiene
+
+    pm = p - um * m; //posizione del thread nella minisequenza
+    q = pm + o * um;
+    }
+    if (stage == 6){ //ultimo stage della fase
+          q = p * 2;
+    }*/
+    
+    k_0 = index1 + q;
+    k_1 = index2 - q; 
+
+    k_0 = start + k_0;
+    k_1 = start + k_1;
+
+    /*
+    if (threadIdx.x == 0)
+        printf("thread %d : stage = %d, offset = %d \n", threadIdx.x, stage, j);
+    printf("thread %d : k_0 = %d, k_1 = %d \n", threadIdx.x, k_0, k_1);
+    */
       
     //k0 ? position of preceding element in the thread's first pair to form ascending order
     if(keyin[k_0] > keyin[k_0+j]){
         int tmp = keyin[k_0];
-        keyin[k_0] = keyin[k_0+j];
-        keyin[k_0+j] = tmp;
+        keyin[k_0] = keyin[k_0 + j];
+        keyin[k_0 + j] = tmp;
     }
 
     //k1 ? position of preceding element in the thread's second pair to form ascending order
-    if(keyin[k_1] > keyin[k_1-j]){
+    if(keyin[k_1] < keyin[k_1 - j]){
         int tmp = keyin[k_1];
-        keyin[k_1] = keyin[k_1-j];
-        keyin[k_1-j] = tmp;
+        keyin[k_1] = keyin[k_1 - j];
+        keyin[k_1 - j] = tmp;
     }
-  }*/
-  
 
+    stage++;
+  }
+  
 }
 
 /*The parameter dir indicates the sorting direction, ASCENDING
