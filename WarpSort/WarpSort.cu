@@ -6,44 +6,46 @@
 #include "../utils/common.h"
 
 #define THREADS 128
-#define BLOCKS 8
+#define BLOCKS 2
 #define T 64
 
 //Merge all the subsequences produced in step 1 until the parallelism is insufficient.
-__device__ void bitonic_warp_merge(int * keyin){
+__global__ void bitonic_warp_merge(int * keyin, int * output){
   
-  int i = 0, j = 0;
+  int j = 0;
   int stage = 0;
   int k_0 = 0;
   int u = 0, index1 = 0, index2 = 0, p = 0, q = 0;
   float dim = 0;
+  int outIndex = threadIdx.x;
 
   __shared__ int buffer[T];
-  __shared__ int tempout[T*2];
 
   unsigned int id = threadIdx.x + blockDim.x * blockIdx.x;
-  unsigned int subseq = id / 32; //in quale sottosequenza dell'array siamo
-  unsigned int start = THREADS * subseq; //primo elemento della sottosequenza da riordinare
+  unsigned int subseq = id / 32; //in quale warp siamo
+  unsigned int start = THREADS * 2 * subseq; //primo elemento della sottosequenza (A e B) da riordinare
 
-  int numSmallSubsequences = THREADS*2 / T;
   int iA = start, iB = start + THREADS;
+  int fA = start + 128, fB = start + THREADS + 128;
+  int tA = threadIdx.x, tB = threadIdx.x;
   bool compare;
   
-  //prendo prima sequenza di A e la metto sul buffer
-  for (iA = start; iA < T/2; i++)
-    buffer[iA] = keyin[start + iA];
 
-  //prendo prima sequenza di B e la metto sul buffer
-  for (iB = start + THREADS; iB < T/2; i++)
-    buffer[iB] = keyin[start + iB];
+  //prendo prima sequenza di A e la prima di B e le copio sul buffer
+  buffer[T/2 - tA] = keyin[start + tA];
+  buffer[tB + T/2 + 1] = keyin[start + THREADS + tB + 1];
+  tA += 32;
+  tB += 32;
+  
+  //A[3] < B[3]
+  compare = buffer[0] < buffer[T/2]; //se true, al prossimo caricamento prendo i primi T/2 valori di A
 
-  compare = buffer[iA] > buffer[iB];
+  int loops = 1;
+  while(loops < 256 / 32)  {
 
-  for(i = 0; i < numSmallSubsequences - 1; i++){
-    
     stage = 0;
     //bitonic based merge sort
-    for(j = T/2; j>0; j/=2){
+    for(j = T/2; j>0; j/=2){ 
       
       dim = j * 2;
       if (dim < 4) dim = 4;
@@ -56,7 +58,7 @@ __device__ void bitonic_warp_merge(int * keyin){
 
       p = threadIdx.x - (u - 1) * (dim / 4); // posizione del thread nella sottosequenza simmetrica
 
-      //q è l'offset usato poi per k_0 e k_1
+      //q è l'offset usato poi per k_0
       
       q = p;
           
@@ -77,9 +79,35 @@ __device__ void bitonic_warp_merge(int * keyin){
 
       stage++;
     }
-  }
+    
+    //carico i primi T/2 elementi di buffer sull'output
+    output[outIndex] = buffer[threadIdx.x];
+    outIndex += 32;
 
-  
+    //se A e B finiscono elementi prima dell'algoritmo, prosegui solo con la sottosequenza rimanente
+    if (tA + 32 > fA && tB + 32 < fB)
+      compare = false;
+    if (tA + 32 < fA && tB + 32 > fB)
+      compare = true;
+    
+    //usa il compare per caricare la prossima sottosequenza da A o B   
+    if (compare){
+      //carico T/2 elementi da A al buffer
+      buffer[31 - tA] = keyin[iA];
+      tA += 32;
+    } else {
+      //carico T/2 elementi da B al buffer
+      buffer[31 - tB] = keyin[iB];
+      tB += 32;
+    }
+
+    if (compare){ //se avevo caricato dalla sequenza A, allora Amax è il primo elemento del buffer e Bmax è l'ultimo
+        compare = buffer[0] < buffer[T/2];
+    } else { //altrimenti ho caricato B sul buffer, e Amax è l'ultimo elemento, mentre Bmax è il primo
+        compare = buffer[0] > buffer[T/2];
+    }
+
+  }
 
 }
 
@@ -290,8 +318,9 @@ int main(void) {
 	printf("CPU elapsed time: %.5f (sec)\n", seconds()-cpu_time);
 
 	// device mem copy
-	int *d_a;
+	int *d_a, * d_b;
 	CHECK(cudaMalloc((void**) &d_a, nBytes));
+  CHECK(cudaMalloc((void**) &d_b, nBytes));
 	CHECK(cudaMemcpy(d_a, a, nBytes, cudaMemcpyHostToDevice));
 
 	// num of threads
@@ -315,6 +344,10 @@ int main(void) {
   Each subsequence will be sorted by an independent warp using the bitonic network.*/
   bitonic_sort_warp<<<blocks, threads>>>(d_a);
 
+  //step 2 
+  //bitonic_warp_merge<<<blocks, threads>>>(d_a, d_b);
+
+
 	cudaEventRecord(stop);
 	cudaEventSynchronize(stop);
 	float milliseconds = 0;
@@ -323,6 +356,7 @@ int main(void) {
 
 	// recover data
 	cudaMemcpy(a, d_a, nBytes, cudaMemcpyDeviceToHost);
+  //cudaMemcpy(a, d_b, nBytes, cudaMemcpyDeviceToHost);
 
 	// print & check
 	if (N < 500) {
