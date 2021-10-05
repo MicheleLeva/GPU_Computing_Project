@@ -8,132 +8,110 @@
 #define THREADS 32
 #define BLOCKS 32
 #define T 64
+#define K 2
 
-//TODO fare questa parametrica finchè il parallelismo è insufficiente 
-//Capire cosa il paper intenda
-//Merge all the subsequences produced in step 1 until the parallelism is insufficient.
-__global__ void bitonic_warp_merge(int * keyin, int * output, int offset){
+
+int * get_splitters (int * input, int N, int s); //preliminary
+
+__global__ void bitonic_sort_warp(int *keyin); //step1
+
+__global__ void bitonic_warp_merge(int * keyin, int * output, int offset); //step2
+
+__global__ void print_array_kernel(int * input, int length);
+
+/******FUNCTIONS*****/
+
+//kernel che stampa i contenuti dell'array in input
+__global__ void print_array_kernel(int * input, int length){
+    for(int i = 0; i < length; i++){
+        printf("Array[%d] = %d \n", i, input[i]);
+    }
+}
+
+//Preliminary splitter preparation function
+int * get_splitters (int * input, int N, int s){
+  int numElements = s * K;
+
+  //printf("numElements = %d\n", numElements);
+
+  size_t nBytes = numElements * sizeof(int);
+	int *arrayA = (int*) malloc(nBytes);
+
+  //seleziona a random numElements elementi da input
+  for (int i = 0; i < numElements; i++){
+      arrayA[i] = input[rand() % numElements];
+      //printf("arrayA[%d] = %d\n", i, arrayA[i]);
+  }
+
+  // num of threads
+	dim3 blocks(BLOCKS, 1);   // Number of blocks
+  dim3 threads(THREADS, 1); // Number of threads
+
+  //device memcopy
+  int *bufferA, *bufferB;
+  CHECK(cudaMalloc((void**) &bufferA, nBytes));
+  CHECK(cudaMalloc((void**) &bufferB, nBytes));
+	CHECK(cudaMemcpy(bufferA, arrayA, nBytes, cudaMemcpyHostToDevice));
+  free(arrayA);
+
+  //printf("\nbufferA prima step1 SORT\n\n");
+  //print_array_kernel<<<1, 1>>>(bufferA, numElements);
+
+  //sorting degli elementi
+
+  bitonic_sort_warp<<<blocks, threads>>>(bufferA);
+
+  //printf("\nbufferA dopo step1 SORT\n\n");
+  //print_array_kernel<<<1, 1>>>(bufferA, numElements);
+
+  bool isAfirst = true;
+  if(numElements > 128){
+    //ad ogni warp merge si inverte input ed output
+    
+    blocks.x = BLOCKS / 2;   // Number of blocks
+    for(int offset = THREADS * 8; N / offset > 1; offset *= 2){
+      //printf("N = %d, offset = %d, blocks.x = %d, threads.x = %d\n", N, offset, blocks, threads);
+      if(isAfirst)
+        bitonic_warp_merge<<<blocks, threads>>>(bufferA, bufferB, offset);
+      else
+        bitonic_warp_merge<<<blocks, threads>>>(bufferB, bufferA, offset);
+      blocks.x = blocks.x / 2;
+      
+      isAfirst = !isAfirst;
+    }
+  }
   
-  int j = 0;
-  int stage = 0;
-  int k_0 = 0;
-  int u = 0, index1 = 0, p = 0;
-  float dim = 0;
-  
-  __shared__ int buffer[T];
+  //printf("\nbufferA dopo SORT\n\n");
+  //print_array_kernel<<<1, 1>>>(bufferA, numElements);
 
-  unsigned int id = threadIdx.x + blockDim.x * blockIdx.x;
-  unsigned int subseq = blockIdx.x; //in quale warp siamo
-  unsigned int start = offset * subseq; //primo elemento della sottosequenza (A e B) da riordinare
+  //printf("\nbufferB dopo SORT\n\n");
+  //print_array_kernel<<<1, 1>>>(bufferB, numElements);
 
-  int outIndex = start + threadIdx.x;
-  int iA = start, iB = start + (offset / 2);
-  int fA = start + (offset / 2), fB = start + offset;
-  int tA = iA + threadIdx.x, tB = iB + threadIdx.x;
-  bool compare;
+  int * orderedSequence = (int*) malloc(numElements * sizeof(int));
+  if(isAfirst){
+    cudaMemcpy(orderedSequence, bufferA, nBytes, cudaMemcpyDeviceToHost);
+  } else {
+    cudaMemcpy(orderedSequence, bufferB, nBytes, cudaMemcpyDeviceToHost);
+  }
+
+  cudaFree(bufferA);
+  cudaFree(bufferB);
 
   /*
-  if (threadIdx.x == 0){
-      printf("block %d - thread %d: subseq = %d, offset = %d\n", blockIdx.x, threadIdx.x, subseq, offset);
-      printf("block %d - thread %d: iA = %d, fA = %d, iB = %d, fB = %d \n", blockIdx.x, threadIdx.x, iA, iB, fA, fB);
+  for (int i = 0; i < numElements; i++){
+      printf("orderedSequence[%d] = %d\n", i, orderedSequence[i]);
   }*/
-    
 
-  //printf("thread %d: tA = %d, tB = %d \n", threadIdx.x, tA, tB);
-
-  //prendo prima sequenza di A e la prima di B e le copio sul buffer
-  buffer[T/2 - 1 - threadIdx.x] = keyin[tA];
-  buffer[T/2 + threadIdx.x] = keyin[tB];
-  tA += THREADS;
-  tB += THREADS;
-  
-  //A[3] < B[3]
-  compare = buffer[0] < buffer[T - 1]; //se true, al prossimo caricamento prendo i primi T/2 valori di A
-
-  int loops = 1;
-  while(true)  {
-
-    /*
-    if (threadIdx.x == 0){
-      printf("loop = %d,\nblock %d, thread %d, START of while: tA = %d, tB = %d \n", loops, blockIdx.x, threadIdx.x, tA, tB);
-    }*/
-    
-
-    stage = 0;
-    //bitonic based merge sort
-    for(j = T/2; j>0; j/=2){ 
-      
-      dim = j * 2;
-      if (dim < 2) dim = 2;
-      u = ceil((threadIdx.x+1) * 2/dim); //indice della sottosequenza su cui il thread deve lavorare
-
-      //printf("thread %d : u = %d \n", threadIdx.x, u);
-
-      index1 = (u - 1) * dim; //primo indice della sottosequenza
-
-      p = threadIdx.x - (u - 1) * (dim / 2); // posizione del thread nella sottosequenza simmetrica
-          
-      k_0 = index1 + p;
-
-      /*
-      if (threadIdx.x == 0){
-        printf("block %d, thread %d : stage = %d, offset = %d \n", blockIdx.x, threadIdx.x, stage, j);
-      }
-      printf("block %d, thread %d : k_0 = %d \n", blockIdx.x, threadIdx.x, k_0);
-      */
-           
-      //k0 ? position of preceding element in the thread's first pair to form ascending order
-      if(buffer[k_0] > buffer[k_0 + j]){
-          int tmp = buffer[k_0];
-          buffer[k_0] = buffer[k_0 + j];
-          buffer[k_0 + j] = tmp;
-      }
-
-      stage++;
-    }
-    
-    //carico i primi T/2 elementi di buffer sull'output
-    output[outIndex] = buffer[threadIdx.x];
-    outIndex += THREADS;
-
-    //se A e B finiscono elementi prima dell'algoritmo, prosegui solo con la sottosequenza rimanente
-    if (tA > fA - 1 && tB < fB - 1)
-      compare = false;
-    if (tA < fA - 1 && tB > fB - 1)
-      compare = true;
-    if (tA > fA - 1 && tB > fB - 1){
-        
-      //carico gli ultimi T/2 elementi del buffer sull'output
-      output[outIndex] = buffer[T/2 + threadIdx.x];
-      
-      break;
-    }
-      
-    
-    //usa il compare per caricare la prossima sottosequenza da A o B   
-    if (compare){
-      //carico T/2 elementi da A al buffer
-      buffer[T/2 - 1 - threadIdx.x] = keyin[tA];
-      tA += THREADS;
-    } else {
-      //carico T/2 elementi da B al buffer
-      buffer[T/2 - 1 - threadIdx.x] = keyin[tB];
-      tB += THREADS;
-    }
-
-    if (compare){ //se avevo caricato dalla sequenza A, allora Amax è il primo elemento del buffer e Bmax è l'ultimo
-        compare = buffer[0] < buffer[T - 1];
-    } else { //altrimenti ho caricato B sul buffer, e Amax è l'ultimo elemento, mentre Bmax è il primo
-        compare = buffer[0] > buffer[T - 1];
-    }
-
-    loops++;
-
-    /*
-    if (threadIdx.x == 0){
-      printf("thread %d, END of while: tA = %d, tB = %d \n",threadIdx.x, tA, tB);
-    }*/
+  //seleziona k elementi dal buffer ordinato e restituisci
+  int *output = (int*) malloc(s*sizeof(int));
+  for(int i = 0; i < s; i ++){
+      output[i] = orderedSequence[i*K];
+      //printf("output[%d] = %d\n", i, output[i]);
   }
+
+  free(orderedSequence);
+   
+  return output;
 
 }
 
@@ -151,6 +129,8 @@ __global__ void bitonic_sort_warp(int *keyin){
   int k_0 = 0, k_1 = 0;
   int u = 0, index1 = 0, index2 = 0, p = 0, q = 0, m = 0, o = 0, um = 0, pm = 0;
   float dim = 0;
+
+  //if (threadIdx.x == 0) printf("bitonic_sort_warp\n");
 
   //phase 0 to log(128)-1 
   for(i=2; i<128 ;i*=2){ 
@@ -265,7 +245,136 @@ __global__ void bitonic_sort_warp(int *keyin){
   }
 }
 
+//Merge all the subsequences produced in step 1 until the parallelism is insufficient.
+__global__ void bitonic_warp_merge(int * keyin, int * output, int offset){
+  
+  int j = 0;
+  int stage = 0;
+  int k_0 = 0;
+  int u = 0, index1 = 0, p = 0;
+  float dim = 0;
+  
+  __shared__ int buffer[T];
 
+  //unsigned int id = threadIdx.x + blockDim.x * blockIdx.x;
+  unsigned int subseq = blockIdx.x; //in quale warp siamo
+  unsigned int start = offset * subseq; //primo elemento della sottosequenza (A e B) da riordinare
+
+  //if (threadIdx.x == 0) printf("bitonic_warp_merge, offset = %d\n", offset);
+
+  int outIndex = start + threadIdx.x;
+  int iA = start, iB = start + (offset / 2);
+  int fA = start + (offset / 2), fB = start + offset;
+  int tA = iA + threadIdx.x, tB = iB + threadIdx.x;
+  bool compare;
+
+  /*
+  if (threadIdx.x == 0){
+      printf("block %d - thread %d: subseq = %d, offset = %d\n", blockIdx.x, threadIdx.x, subseq, offset);
+      printf("block %d - thread %d: iA = %d, fA = %d, iB = %d, fB = %d \n", blockIdx.x, threadIdx.x, iA, iB, fA, fB);
+  }*/
+    
+
+  //printf("thread %d: tA = %d, tB = %d \n", threadIdx.x, tA, tB);
+
+  //prendo prima sequenza di A e la prima di B e le copio sul buffer
+  buffer[T/2 - 1 - threadIdx.x] = keyin[tA];
+  buffer[T/2 + threadIdx.x] = keyin[tB];
+  tA += THREADS;
+  tB += THREADS;
+  
+  //A[3] < B[3]
+  compare = buffer[0] < buffer[T - 1]; //se true, al prossimo caricamento prendo i primi T/2 valori di A
+
+  int loops = 1;
+  while(true)  {
+
+    /*
+    if (threadIdx.x == 0){
+      printf("loop = %d,\nblock %d, thread %d, START of while: tA = %d, tB = %d \n", loops, blockIdx.x, threadIdx.x, tA, tB);
+    }*/
+    
+
+    stage = 0;
+    //bitonic based merge sort
+    for(j = T/2; j>0; j/=2){ 
+      
+      dim = j * 2;
+      if (dim < 2) dim = 2;
+      u = ceil((threadIdx.x+1) * 2/dim); //indice della sottosequenza su cui il thread deve lavorare
+
+      //printf("thread %d : u = %d \n", threadIdx.x, u);
+
+      index1 = (u - 1) * dim; //primo indice della sottosequenza
+
+      p = threadIdx.x - (u - 1) * (dim / 2); // posizione del thread nella sottosequenza simmetrica
+          
+      k_0 = index1 + p;
+
+      /*
+      if (threadIdx.x == 0){
+        printf("block %d, thread %d : stage = %d, offset = %d \n", blockIdx.x, threadIdx.x, stage, j);
+      }
+      printf("block %d, thread %d : k_0 = %d \n", blockIdx.x, threadIdx.x, k_0);
+      */
+           
+      //k0 ? position of preceding element in the thread's first pair to form ascending order
+      if(buffer[k_0] > buffer[k_0 + j]){
+          int tmp = buffer[k_0];
+          buffer[k_0] = buffer[k_0 + j];
+          buffer[k_0 + j] = tmp;
+      }
+
+      stage++;
+    }
+    
+    //carico i primi T/2 elementi di buffer sull'output
+    output[outIndex] = buffer[threadIdx.x];
+    outIndex += THREADS;
+
+    //se A e B finiscono elementi prima dell'algoritmo, prosegui solo con la sottosequenza rimanente
+    if (tA > fA - 1 && tB < fB - 1)
+      compare = false;
+    if (tA < fA - 1 && tB > fB - 1)
+      compare = true;
+    if (tA > fA - 1 && tB > fB - 1){
+        
+      //carico gli ultimi T/2 elementi del buffer sull'output
+      output[outIndex] = buffer[T/2 + threadIdx.x];
+      
+      break;
+    }
+      
+    
+    //usa il compare per caricare la prossima sottosequenza da A o B   
+    if (compare){
+      //carico T/2 elementi da A al buffer
+      buffer[T/2 - 1 - threadIdx.x] = keyin[tA];
+      tA += THREADS;
+    } else {
+      //carico T/2 elementi da B al buffer
+      buffer[T/2 - 1 - threadIdx.x] = keyin[tB];
+      tB += THREADS;
+    }
+
+    if (compare){ //se avevo caricato dalla sequenza A, allora Amax è il primo elemento del buffer e Bmax è l'ultimo
+        compare = buffer[0] < buffer[T - 1];
+    } else { //altrimenti ho caricato B sul buffer, e Amax è l'ultimo elemento, mentre Bmax è il primo
+        compare = buffer[0] > buffer[T - 1];
+    }
+
+    loops++;
+
+    /*
+    if (threadIdx.x == 0){
+      printf("thread %d, END of while: tA = %d, tB = %d \n",threadIdx.x, tA, tB);
+    }*/
+  }
+
+}
+
+
+/*******FUNZIONI DEL PROFESSORE*********/
 
 /*The parameter dir indicates the sorting direction, ASCENDING
  or DESCENDING; if (a[i] > a[j]) agrees with the direction,
@@ -362,28 +471,32 @@ int main(void) {
       bitonic_sort_step<<<blocks, threads * 4>>>(d_a, j, k);
   }
   */
-	
-  // start computation
-	cudaEventRecord(start);
-  /*Divide the input sequence into equal-sized subsequences. 
-  Each subsequence will be sorted by an independent warp using the bitonic network.*/
-  bitonic_sort_warp<<<blocks, threads>>>(d_a);
 
   cudaDeviceProp deviceProp;
 	cudaGetDeviceProperties(&deviceProp, 0);
   int l = deviceProp.multiProcessorCount; //numero di streaming multiprocessor della GPU
+  for (int k = 2; k < 1000; k *= 2){
+      if (k > 4 * l){
+          l = k;
+          break;
+      }
+  }
+  int s = l; 
 
-  printf ("Streaming multiprocessors = %d\n", l);
+  printf ("\nStreaming multiprocessors = %d\n", l);
+	
+  // start computation
+	cudaEventRecord(start);
 
- 
-  /*Merge all the subsequences produced in step 1 until the parallelism is insufficient.*/
-  //finchè il parallelismo è insufficiente
-  //ovvero finchè N / offset >= l
+  /*PRELIMINARY SPLITTER STEP*********************************************************************/
+  int *output = get_splitters (a, N, s);
+  
+  /*STEP 1: Divide the input sequence into equal-sized subsequences. *******************************************
+  Each subsequence will be sorted by an independent warp using the bitonic network.*/
+  bitonic_sort_warp<<<blocks, threads>>>(d_a);
 
-  //bitonic_warp_merge<<<blocks, threads>>>(d_a, d_b, 256);
-  //blocks.x = blocks.x / 2;   // Number of blocks
-  //bitonic_warp_merge<<<blocks, threads>>>(d_a, d_a, 512);
-
+  /*STEP 2: Merge all the subsequences produced in step 1 until the parallelism is insufficient.*******************/
+  //finchè il parallelismo è insufficiente, ovvero finchè N / offset >= l
   //ad ogni warp merge si inverte input ed output
   bool isAfirst = true;
   blocks.x = BLOCKS / 2;   // Number of blocks
@@ -438,5 +551,6 @@ int main(void) {
 	}
 
 	cudaFree(d_a);
+  cudaFree(d_b);
 	exit(0);
 }
