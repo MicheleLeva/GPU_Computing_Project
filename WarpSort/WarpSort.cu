@@ -8,7 +8,7 @@
 #define THREADS 32
 #define BLOCKS 32
 #define T 64
-#define K 2
+#define K 8
 
 
 int * get_splitters (int * input, int N, int s); //preliminary
@@ -97,16 +97,16 @@ int * get_splitters (int * input, int N, int s){
   cudaFree(bufferA);
   cudaFree(bufferB);
 
-  /*
+  
   for (int i = 0; i < numElements; i++){
       printf("orderedSequence[%d] = %d\n", i, orderedSequence[i]);
-  }*/
+  }
 
   //seleziona k elementi dal buffer ordinato e restituisci
   int *output = (int*) malloc(s*sizeof(int));
   for(int i = 0; i < s; i ++){
       output[i] = orderedSequence[i*K];
-      //printf("output[%d] = %d\n", i, output[i]);
+      printf("output[%d] = %d\n", i, output[i]);
   }
 
   free(orderedSequence);
@@ -438,6 +438,7 @@ int main(void) {
 	int *a = (int*) malloc(nBytes);
 	int *b = (int*) malloc(nBytes);
 
+  srand ( time(NULL) );
 	// fill data
 	for (int i = 0; i < N; ++i) {
 		//a[i] =  i%5; //rand() % 100; // / (float) RAND_MAX;
@@ -475,8 +476,8 @@ int main(void) {
   cudaDeviceProp deviceProp;
 	cudaGetDeviceProperties(&deviceProp, 0);
   int l = deviceProp.multiProcessorCount; //numero di streaming multiprocessor della GPU
-  for (int k = 2; k < 1000; k *= 2){
-      if (k > 4 * l){
+  for (int k = 2; k < 1000; k *= 2){ 
+      if (k > l){ //TODO controllare se moltiplicando per 4 come suggerisce il paper migliora le prestazioni
           l = k;
           break;
       }
@@ -485,11 +486,13 @@ int main(void) {
 
   printf ("\nStreaming multiprocessors = %d\n", l);
 	
+  
   // start computation
 	cudaEventRecord(start);
 
   /*PRELIMINARY SPLITTER STEP*********************************************************************/
   int *output = get_splitters (a, N, s);
+
   
   /*STEP 1: Divide the input sequence into equal-sized subsequences. *******************************************
   Each subsequence will be sorted by an independent warp using the bitonic network.*/
@@ -500,7 +503,8 @@ int main(void) {
   //ad ogni warp merge si inverte input ed output
   bool isAfirst = true;
   blocks.x = BLOCKS / 2;   // Number of blocks
-  for(int offset = THREADS * 8; N / offset >= 1; offset *= 2){
+  l = 8; //TODO rimuovere, è solo per testing!!!!!
+  for(int offset = THREADS * 8; N / offset >= l ; offset *= 2){ 
     if(isAfirst)
       bitonic_warp_merge<<<blocks, threads>>>(d_a, d_b, offset);
     else
@@ -512,6 +516,44 @@ int main(void) {
   //TODO ricordarsi che Afirst è poi true se l'output finale è in A, false se è in B
   //TODO ricorarsi di resettare il numero di blocchi (warp)
  
+  if(!isAfirst){
+      int * temp = d_a;
+      d_a = d_b;
+      cudaFree(temp);
+  }
+  
+  /*STEP 3: Split the large subsequences produced in step 2 into small ones that can be merged independently.*******************/
+  int l_indexes[l];
+  //printf("***l indici***\n");
+  for (int i = 0; i < l; i++){
+      l_indexes[i] = N / l * i;
+      //printf("indice %d di l = %d\n", i, l_indexes[i]);
+
+  }
+
+  // recover data
+  cudaMemcpy(a, d_a, nBytes, cudaMemcpyDeviceToHost);
+
+  int s_indexes[l][s];
+  int temp_i, temp_s;
+  for (int i = 0; i < l; i++){ 
+    temp_i = N / l * i;
+    int splitCount = 0;
+    s_indexes[i][splitCount] = temp_i;
+    int splitter_index = 0;
+    printf("indice %d di l = %d\n", i, s_indexes[i][0]);
+    for(int j = temp_i; j < temp_i + (N / l) - 1; j++){
+        if (output[splitter_index] < a[j]){
+            splitter_index++;
+            splitCount++;
+            s_indexes[i][splitCount] = j;
+            printf("indice %d, %d di l, s = %d\n", i, splitCount, s_indexes[i][splitCount]);    
+        }
+        
+    }
+    
+  }
+
 
 	cudaEventRecord(stop);
 	cudaEventSynchronize(stop);
@@ -520,13 +562,11 @@ int main(void) {
 	printf("GPU elapsed time: %.5f (sec)\n", milliseconds / 1000);
 
 	// recover data
-  if (isAfirst)
-	  cudaMemcpy(a, d_a, nBytes, cudaMemcpyDeviceToHost);
-  else
-    cudaMemcpy(a, d_b, nBytes, cudaMemcpyDeviceToHost);
+  cudaMemcpy(a, d_a, nBytes, cudaMemcpyDeviceToHost);
+
 
 	// print & check
-	if (N < 1000) {
+	if (N < 100) {
 		printf("GPU:\n");
 		for (int i = 0; i < N; ++i){
       if(i % 128 == 0)
