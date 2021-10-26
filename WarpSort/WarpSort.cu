@@ -19,6 +19,8 @@ __global__ void bitonic_warp_merge(int * keyin, int * output, int offset); //ste
 
 __global__ void print_array_kernel(int * input, int length);
 
+int get_length (int * array);
+
 /******FUNCTIONS*****/
 
 //kernel che stampa i contenuti dell'array in input
@@ -26,6 +28,15 @@ __global__ void print_array_kernel(int * input, int length){
     for(int i = 0; i < length; i++){
         printf("Array[%d] = %d \n", i, input[i]);
     }
+}
+
+//returns the length of the array
+int get_length(int * array){
+  int i;
+  for(i = 0; array[i] >= 0 && array[i] < 100; i++){
+      ;
+  }
+  return i;
 }
 
 //Preliminary splitter preparation function
@@ -97,15 +108,20 @@ int * get_splitters (int * input, int N, int s){
   cudaFree(bufferA);
   cudaFree(bufferB);
 
-  
+  /*
   for (int i = 0; i < numElements; i++){
       printf("orderedSequence[%d] = %d\n", i, orderedSequence[i]);
-  }
+  }*/
 
   //seleziona k elementi dal buffer ordinato e restituisci
   int *output = (int*) malloc(s*sizeof(int));
+  int last_split = -1;
   for(int i = 0; i < s; i ++){
       output[i] = orderedSequence[i*K];
+      if (output[i] == last_split){
+          output[i]++;
+      }
+      last_split = output[i];
       printf("output[%d] = %d\n", i, output[i]);
   }
 
@@ -115,7 +131,7 @@ int * get_splitters (int * input, int N, int s){
 
 }
 
-/*Divide the input sequence into equal-sized subsequences. 
+/*STEP 1:  Divide the input sequence into equal-sized subsequences. 
   Each subsequence will be sorted by an independent warp using the bitonic network.*/
 __global__ void bitonic_sort_warp(int *keyin){
   //prendere thread id giusto tenendo in considerazione k_0 e k_1
@@ -245,7 +261,7 @@ __global__ void bitonic_sort_warp(int *keyin){
   }
 }
 
-//Merge all the subsequences produced in step 1 until the parallelism is insufficient.
+//STEP 2: Merge all the subsequences produced in step 1 until the parallelism is insufficient.
 __global__ void bitonic_warp_merge(int * keyin, int * output, int offset){
   
   int j = 0;
@@ -490,13 +506,16 @@ int main(void) {
   // start computation
 	cudaEventRecord(start);
 
-  /*PRELIMINARY SPLITTER STEP*********************************************************************/
+  /*PRELIMINARY SPLITTER STEP3*********************************************************************/
   int *output = get_splitters (a, N, s);
 
+  printf("\n **********length of A = %d  *********\n\n", get_length(a));
   
   /*STEP 1: Divide the input sequence into equal-sized subsequences. *******************************************
   Each subsequence will be sorted by an independent warp using the bitonic network.*/
   bitonic_sort_warp<<<blocks, threads>>>(d_a);
+
+  printf("\n **********length of A = %d  *********\n\n", get_length(a));
 
   /*STEP 2: Merge all the subsequences produced in step 1 until the parallelism is insufficient.*******************/
   //finchè il parallelismo è insufficiente, ovvero finchè N / offset >= l
@@ -521,39 +540,132 @@ int main(void) {
       d_a = d_b;
       cudaFree(temp);
   }
+
+  printf("\n **********length of A = %d  *********\n\n", get_length(a));
   
   /*STEP 3: Split the large subsequences produced in step 2 into small ones that can be merged independently.*******************/
-  int l_indexes[l];
-  //printf("***l indici***\n");
-  for (int i = 0; i < l; i++){
-      l_indexes[i] = N / l * i;
-      //printf("indice %d di l = %d\n", i, l_indexes[i]);
-
-  }
 
   // recover data
   cudaMemcpy(a, d_a, nBytes, cudaMemcpyDeviceToHost);
 
   int s_indexes[l][s];
-  int temp_i, temp_s;
+  int temp_i;
   for (int i = 0; i < l; i++){ 
     temp_i = N / l * i;
     int splitCount = 0;
     s_indexes[i][splitCount] = temp_i;
     int splitter_index = 0;
-    printf("indice %d di l = %d\n", i, s_indexes[i][0]);
+    //printf("indice %d di l = %d\n", i, s_indexes[i][0]);
     for(int j = temp_i; j < temp_i + (N / l) - 1; j++){
         if (output[splitter_index] < a[j]){
             splitter_index++;
             splitCount++;
             s_indexes[i][splitCount] = j;
-            printf("indice %d, %d di l, s = %d\n", i, splitCount, s_indexes[i][splitCount]);    
-        }
-        
+            //printf("indice %d, %d di l, s = %d\n", i, splitCount, s_indexes[i][splitCount]);    
+        } 
     }
-    
   }
 
+  printf("\n **********length of A = %d  *********\n\n", get_length(a));
+
+  /****STEP 4: *************************************************************************************************/
+  int *cpu_buffer; //buffer on cpu used to build the first s segment with -1 placeholders
+  int *d_buffer, *d_buffer_temp;
+  int s_length, global_index = 0;
+
+  for (int i = 0; i < s; i++){
+    printf("colonna %d\n", i);
+    cpu_buffer = (int*) malloc(l * 128 * sizeof(int));
+
+    CHECK(cudaMalloc((void**) &d_buffer, l * 128 * sizeof(int)));
+    CHECK(cudaMalloc((void**) &d_buffer_temp, l * 128 * sizeof(int)));
+
+    for (int j = 0; j < l; j++){
+      if (i + 1 >= s && j + 1 >= l){
+        s_length = N - s_indexes[j][i]; //calcoliamo la lunghezza del segmento s
+      } else{
+        s_length = s_indexes[j][i + 1] - s_indexes[j][i] - 1; //calcoliamo la lunghezza del segmento s
+      }
+      
+      int s_index = s_indexes[j][i]; //troviamo la posizione del primo elemento del segmento s
+      for (int k = 0 ; k < 128; k++){
+        if (k < 128 - s_length){
+          cpu_buffer[128 * j + k] = -1;
+        } else {
+          cpu_buffer[128 * j + k] = a[s_index];
+          s_index++;
+        }  
+      }
+    }
+
+    /*
+    //print 
+    printf("\n**********STAMPA DEL BUFFER PRIMA DELLO STEP2 di s(x, %d)************\n\n", i);
+    for (int p = 0; p < l * 128; p++){
+      printf("cpu_buffer[%d] = %d\n", p, cpu_buffer[p]);
+    }*/
+
+    CHECK(cudaMemcpy(d_buffer, cpu_buffer, l * 128 * sizeof(int), cudaMemcpyHostToDevice));
+
+    //fai step 2 su d_buffer
+    blocks.x = l / 2;   // Number of blocks (warps)
+    isAfirst = true;
+    for(int offset = THREADS * 8; l * 128 / offset >= 1 ; offset *= 2){ 
+      //printf("\nStep 2 presente!!!!\n\n" );
+      if(isAfirst)
+        bitonic_warp_merge<<<blocks, threads>>>(d_buffer, d_buffer_temp, offset);
+      else
+        bitonic_warp_merge<<<blocks, threads>>>(d_buffer_temp, d_buffer, offset);
+      blocks.x = blocks.x / 2;
+      
+      isAfirst = !isAfirst;
+    }
+    
+    if(!isAfirst){
+      int * temp = d_buffer;
+      d_buffer = d_buffer_temp;
+      cudaFree(temp);
+    }
+
+    // recover data
+    CHECK(cudaMemcpy(cpu_buffer, d_buffer, l * 128 * sizeof(int), cudaMemcpyDeviceToHost));
+
+    
+    //print 
+    printf("\n**********STAMPA DEL BUFFER DOPO LO STEP 2 di s(x, %d)************\n\n", i);
+    for (int p = 0; p < l * 128; p++){
+        if (cpu_buffer[p] != -1){
+          printf("cpu_buffer[%d] = %d\n", p, cpu_buffer[p]);
+          global_index++;
+        } 
+    }
+    
+    //TODO capire perchè ci sono solo 3969 valori in A invece di 4096
+
+    //TODO capire perchè sto codice non funziona come dovrebbe
+    /*
+    //salvo il buffer ordinato sull'output finale a rimuovendo i placeholder -1
+    free(a);
+    a = (int*) malloc(nBytes);
+    for(int z = 0; z < l * 128; z++){
+      if (cpu_buffer[z] != -1){
+        a[global_index] = cpu_buffer[z];
+        global_index++;
+        printf("a[%d] = %d\n", global_index, a[global_index]);
+      } 
+    }*/
+
+    cudaFree(d_buffer); 
+    cudaFree(d_buffer_temp); 
+    free(cpu_buffer);
+  }
+
+  /*
+  for(int i = 0; i < N; i++){
+      printf("a[%d] = %d\n", i, a[i]);
+  }*/
+
+  printf("global_index = %d\n", global_index);
 
 	cudaEventRecord(stop);
 	cudaEventSynchronize(stop);
