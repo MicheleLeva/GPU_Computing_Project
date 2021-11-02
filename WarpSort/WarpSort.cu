@@ -6,7 +6,7 @@
 #include "../utils/common.h"
 
 #define THREADS 32
-#define BLOCKS 32
+#define BLOCKS 64
 #define T 64
 #define K 8
 
@@ -70,7 +70,7 @@ int * get_splitters (int * input, int N, int s){
   if(numElements > 128){
     //ad ogni warp merge si inverte input ed output
     
-    blocks.x = BLOCKS / 2;   // Number of blocks
+    blocks.x = (numElements / 128) / 2;   // Number of blocks
     for(int offset = THREADS * 8; N / offset > 1; offset *= 2){
       //printf("N = %d, offset = %d, blocks.x = %d, threads.x = %d\n", N, offset, blocks, threads);
       if(isAfirst)
@@ -489,7 +489,7 @@ int main(void) {
           break;
       }
   }
-  int s = l; 
+  int s = l * 2; 
 
   printf ("\nStreaming multiprocessors = %d\n", l);
 	
@@ -519,8 +519,6 @@ int main(void) {
     
     isAfirst = !isAfirst;
   }
-  //TODO ricordarsi che Afirst è poi true se l'output finale è in A, false se è in B
-  //TODO ricorarsi di resettare il numero di blocchi (warp)
  
   if(!isAfirst){
       int * temp = d_a;
@@ -577,7 +575,11 @@ int main(void) {
         s_length = s_indexes[j][i + 1] - s_indexes[j][i]; //calcoliamo la lunghezza del segmento s
       }
       
-      //printf("segmento %d, %d: s_length = %d\n", j, i, s_length);
+      printf("segmento %d, %d: s_length = %d\n", j, i, s_length);
+      if(s_length > 128){
+          printf("\n\n ERRORE SEGMENTO > 128\n\n");
+          break;
+      }
       global_s_lengths += s_length;
 
       int s_index = s_indexes[j][i]; //troviamo la posizione del primo elemento del segmento s
@@ -644,7 +646,7 @@ int main(void) {
     for(int z = 0; z < l * 128; z++){
       if (cpu_buffer[z] != -1){
         a_output[global_index] = cpu_buffer[z];
-        printf("a[%d] = %d\n", global_index, a_output[global_index]);
+        //printf("a[%d] = %d\n", global_index, a_output[global_index]);
         global_index++;
         
       } 
