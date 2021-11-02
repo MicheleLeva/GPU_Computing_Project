@@ -30,15 +30,6 @@ __global__ void print_array_kernel(int * input, int length){
     }
 }
 
-//returns the length of the array
-int get_length(int * array){
-  int i;
-  for(i = 0; array[i] >= 0 && array[i] < 100; i++){
-      ;
-  }
-  return i;
-}
-
 //Preliminary splitter preparation function
 int * get_splitters (int * input, int N, int s){
   int numElements = s * K;
@@ -437,7 +428,7 @@ void bitonicSort(int a[], int low, int cnt, int dir) {
 }
 
 /*
- * test bitonic sort on CPU and GPU
+ ******************* MAIN *****************************************************************
  */
 int main(void) {
 	cudaEvent_t start, stop;
@@ -508,14 +499,10 @@ int main(void) {
 
   /*PRELIMINARY SPLITTER STEP3*********************************************************************/
   int *output = get_splitters (a, N, s);
-
-  printf("\n **********length of A = %d  *********\n\n", get_length(a));
   
   /*STEP 1: Divide the input sequence into equal-sized subsequences. *******************************************
   Each subsequence will be sorted by an independent warp using the bitonic network.*/
   bitonic_sort_warp<<<blocks, threads>>>(d_a);
-
-  printf("\n **********length of A = %d  *********\n\n", get_length(a));
 
   /*STEP 2: Merge all the subsequences produced in step 1 until the parallelism is insufficient.*******************/
   //finchè il parallelismo è insufficiente, ovvero finchè N / offset >= l
@@ -540,8 +527,6 @@ int main(void) {
       d_a = d_b;
       cudaFree(temp);
   }
-
-  printf("\n **********length of A = %d  *********\n\n", get_length(a));
   
   /*STEP 3: Split the large subsequences produced in step 2 into small ones that can be merged independently.*******************/
 
@@ -550,45 +535,53 @@ int main(void) {
 
   int s_indexes[l][s];
   int temp_i;
-  for (int i = 0; i < l; i++){ 
+  for (int i = 0; i < l; i++){ //per ogni riga 
     temp_i = N / l * i;
     int splitCount = 0;
-    s_indexes[i][splitCount] = temp_i;
-    int splitter_index = 0;
+    s_indexes[i][splitCount] = temp_i; //inserisco l'indice per il primo segmento della riga
+    splitCount++;
     //printf("indice %d di l = %d\n", i, s_indexes[i][0]);
-    for(int j = temp_i; j < temp_i + (N / l) - 1; j++){
-        if (output[splitter_index] < a[j]){
-            splitter_index++;
-            splitCount++;
+    for(int j = temp_i; splitCount < s ; j++){ //calcolo gli indici dei rimanenti segmenti della riga
+        if (output[splitCount] < a[j]){
             s_indexes[i][splitCount] = j;
-            //printf("indice %d, %d di l, s = %d\n", i, splitCount, s_indexes[i][splitCount]);    
+            //printf("indice %d, %d di l, s = %d\n", i, splitCount, s_indexes[i][splitCount]);  
+            splitCount++;  
         } 
     }
   }
-
-  printf("\n **********length of A = %d  *********\n\n", get_length(a));
 
   /****STEP 4: *************************************************************************************************/
   int *cpu_buffer; //buffer on cpu used to build the first s segment with -1 placeholders
   int *d_buffer, *d_buffer_temp;
   int s_length, global_index = 0;
+  int global_s_lengths = 0;
 
-  for (int i = 0; i < s; i++){
-    printf("colonna %d\n", i);
+  int *a_output;
+  a_output = (int*) malloc(nBytes);
+
+  for (int i = 0; i < s; i++){ //per ogni colonna
+    //printf("\n\n---------------COLONNA---------------------- %d\n\n", i);
     cpu_buffer = (int*) malloc(l * 128 * sizeof(int));
 
     CHECK(cudaMalloc((void**) &d_buffer, l * 128 * sizeof(int)));
     CHECK(cudaMalloc((void**) &d_buffer_temp, l * 128 * sizeof(int)));
 
+    //copia dei valori dei segmenti s in un buffer
     for (int j = 0; j < l; j++){
-      if (i + 1 >= s && j + 1 >= l){
-        s_length = N - s_indexes[j][i]; //calcoliamo la lunghezza del segmento s
+      if (i + 1 >= s){
+        if (j + 1 >= l)
+          s_length = N - s_indexes[j][i]; //caso limite ultimo segmento
+        else
+          s_length = s_indexes[j + 1][0] - s_indexes[j][i]; //ultimo segmento della riga
       } else{
-        s_length = s_indexes[j][i + 1] - s_indexes[j][i] - 1; //calcoliamo la lunghezza del segmento s
+        s_length = s_indexes[j][i + 1] - s_indexes[j][i]; //calcoliamo la lunghezza del segmento s
       }
       
+      //printf("segmento %d, %d: s_length = %d\n", j, i, s_length);
+      global_s_lengths += s_length;
+
       int s_index = s_indexes[j][i]; //troviamo la posizione del primo elemento del segmento s
-      for (int k = 0 ; k < 128; k++){
+      for (int k = 0 ; k < 128; k++){ //riempiamo il buffer con -1 e i valori del segmento s
         if (k < 128 - s_length){
           cpu_buffer[128 * j + k] = -1;
         } else {
@@ -598,16 +591,20 @@ int main(void) {
       }
     }
 
-    /*
+    
     //print 
-    printf("\n**********STAMPA DEL BUFFER PRIMA DELLO STEP2 di s(x, %d)************\n\n", i);
-    for (int p = 0; p < l * 128; p++){
-      printf("cpu_buffer[%d] = %d\n", p, cpu_buffer[p]);
+    /*
+    if (i == 0){
+      printf("\n**********STAMPA DEL BUFFER PRIMA DELLO STEP2 di s(x, %d)************\n\n", i);
+      for (int p = 0; p < l * 128; p++){ 
+        printf("cpu_buffer[%d] = %d\n", p, cpu_buffer[p]);
+      }
     }*/
-
+    
     CHECK(cudaMemcpy(d_buffer, cpu_buffer, l * 128 * sizeof(int), cudaMemcpyHostToDevice));
+    free(cpu_buffer);
 
-    //fai step 2 su d_buffer
+    //fai step 2 su d_buffer (la colonna)
     blocks.x = l / 2;   // Number of blocks (warps)
     isAfirst = true;
     for(int offset = THREADS * 8; l * 128 / offset >= 1 ; offset *= 2){ 
@@ -622,50 +619,44 @@ int main(void) {
     }
     
     if(!isAfirst){
-      int * temp = d_buffer;
-      d_buffer = d_buffer_temp;
-      cudaFree(temp);
+      CHECK(cudaMemcpy(cpu_buffer, d_buffer_temp, l * 128 * sizeof(int), cudaMemcpyDeviceToHost));
+    } else {
+      CHECK(cudaMemcpy(cpu_buffer, d_buffer, l * 128 * sizeof(int), cudaMemcpyDeviceToHost));
     }
-
-    // recover data
-    CHECK(cudaMemcpy(cpu_buffer, d_buffer, l * 128 * sizeof(int), cudaMemcpyDeviceToHost));
-
     
-    //print 
-    printf("\n**********STAMPA DEL BUFFER DOPO LO STEP 2 di s(x, %d)************\n\n", i);
+    /*
+    //printf("\n**********STAMPA DEL BUFFER DOPO LO STEP 2 di s(x, %d)************\n\n", i);
+    int num_veri = 0;
     for (int p = 0; p < l * 128; p++){
-        if (cpu_buffer[p] != -1){
-          printf("cpu_buffer[%d] = %d\n", p, cpu_buffer[p]);
+        if (cpu_buffer[p] > -1){
+          //if (i == 0) printf("cpu_buffer[%d] = %d\n", p, cpu_buffer[p]);
+          num_veri++;
           global_index++;
         } 
-    }
+    }*/
+   
+    //printf("global_index nel for, colonna %d = %d\n", i, global_index);
+    //printf("num_veri nel for, colonna %d = %d\n", i, num_veri);
+    //printf("global_s_lengths nel for, colonna %d = %d\n", i, global_s_lengths);
     
-    //TODO capire perchè ci sono solo 3969 valori in A invece di 4096
-
-    //TODO capire perchè sto codice non funziona come dovrebbe
-    /*
+    
     //salvo il buffer ordinato sull'output finale a rimuovendo i placeholder -1
-    free(a);
-    a = (int*) malloc(nBytes);
     for(int z = 0; z < l * 128; z++){
       if (cpu_buffer[z] != -1){
-        a[global_index] = cpu_buffer[z];
+        a_output[global_index] = cpu_buffer[z];
+        printf("a[%d] = %d\n", global_index, a_output[global_index]);
         global_index++;
-        printf("a[%d] = %d\n", global_index, a[global_index]);
+        
       } 
-    }*/
+    }
 
     cudaFree(d_buffer); 
     cudaFree(d_buffer_temp); 
     free(cpu_buffer);
   }
 
-  /*
-  for(int i = 0; i < N; i++){
-      printf("a[%d] = %d\n", i, a[i]);
-  }*/
-
-  printf("global_index = %d\n", global_index);
+  //printf("\n\nglobal_index = %d\n", global_index);
+  //printf("global_s_lengths = %d\n", global_s_lengths);
 
 	cudaEventRecord(stop);
 	cudaEventSynchronize(stop);
@@ -674,7 +665,7 @@ int main(void) {
 	printf("GPU elapsed time: %.5f (sec)\n", milliseconds / 1000);
 
 	// recover data
-  cudaMemcpy(a, d_a, nBytes, cudaMemcpyDeviceToHost);
+  //cudaMemcpy(a, d_a, nBytes, cudaMemcpyDeviceToHost);
 
 
 	// print & check
@@ -695,13 +686,15 @@ int main(void) {
 	else {
     
 		for (int i = 0; i < N; ++i) {
-			if (a[i] != b[i]) {
-				printf("ERROR a[%d] != b[%d]  (a[i] = %d  -  b[i] = %d\n", i,i, a[i],b[i]);
+			if (a_output[i] != b[i]) {
+				printf("ERROR a[%d] != b[%d]  (a[i] = %d  -  b[i] = %d\n", i,i, a_output[i],b[i]);
 				break;
 			}
 		}
 	}
 
+  free(a);
+  free(a_output);
 	cudaFree(d_a);
   cudaFree(d_b);
 	exit(0);
