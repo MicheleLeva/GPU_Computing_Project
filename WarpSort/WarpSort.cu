@@ -6,7 +6,7 @@
 #include "../utils/common.h"
 
 #define THREADS 32
-#define BLOCKS 64
+#define BLOCKS 128
 #define T 64
 #define K 8
 
@@ -23,6 +23,8 @@ int get_length (int * array);
 
 /******FUNCTIONS*****/
 
+
+
 //kernel che stampa i contenuti dell'array in input
 __global__ void print_array_kernel(int * input, int length){
     for(int i = 0; i < length; i++){
@@ -30,6 +32,7 @@ __global__ void print_array_kernel(int * input, int length){
     }
 }
 
+//TODO CAMBIARE SORTING DEGLI ELEMENTI PER NUMELEMENTS > 128
 //Preliminary splitter preparation function
 int * get_splitters (int * input, int N, int s){
   int numElements = s * K;
@@ -46,7 +49,7 @@ int * get_splitters (int * input, int N, int s){
   }
 
   // num of threads
-	dim3 blocks(BLOCKS, 1);   // Number of blocks
+	dim3 blocks(numElements / 128, 1);   // Number of blocks
   dim3 threads(THREADS, 1); // Number of threads
 
   //device memcopy
@@ -69,7 +72,6 @@ int * get_splitters (int * input, int N, int s){
   bool isAfirst = true;
   if(numElements > 128){
     //ad ogni warp merge si inverte input ed output
-    
     blocks.x = (numElements / 128) / 2;   // Number of blocks
     for(int offset = THREADS * 8; numElements / offset >= 1; offset *= 2){
       //printf("N = %d, offset = %d, blocks.x = %d, threads.x = %d\n", N, offset, blocks, threads);
@@ -113,7 +115,7 @@ int * get_splitters (int * input, int N, int s){
           output[i]++;
       }
       last_split = output[i];
-      printf("output[%d] = %d\n", i, output[i]);
+      //printf("output[%d] = %d\n", i, output[i]);
   }
 
   free(orderedSequence);
@@ -336,15 +338,19 @@ __global__ void bitonic_warp_merge(int * keyin, int * output, int offset){
     }
     
     //carico i primi T/2 elementi di buffer sull'output
-    output[outIndex] = buffer[threadIdx.x];
+    if (outIndex > fB)
+      printf("ERRORE! outIndex è troppo grande -> outIndex = %d > tA = %d, fA = %d, tb = %d, fB = %dt\n", outIndex,
+             tA, fA, tB, fB);
+    else
+      output[outIndex] = buffer[threadIdx.x];
     outIndex += THREADS;
 
     //se A e B finiscono elementi prima dell'algoritmo, prosegui solo con la sottosequenza rimanente
-    if (tA > fA - 1 && tB < fB - 1)
+    if (tA >= fA  && tB < fB )
       compare = false;
-    if (tA < fA - 1 && tB > fB - 1)
+    if (tA < fA && tB >= fB)
       compare = true;
-    if (tA > fA - 1 && tB > fB - 1){
+    if (tA >= fA && tB >= fB){
         
       //carico gli ultimi T/2 elementi del buffer sull'output
       output[outIndex] = buffer[T/2 + threadIdx.x];
@@ -436,6 +442,7 @@ int main(void) {
 	cudaEventCreate(&stop);
 
 	int N = THREADS*4*BLOCKS;
+  printf ("N = %d\n",N);
 	// check
 	if (!(N && !(N & (N - 1)))) {
 		printf("ERROR: N must be power of 2 (N = %d)\n", N);
@@ -449,7 +456,7 @@ int main(void) {
 	// fill data
 	for (int i = 0; i < N; ++i) {
 		//a[i] =  i%5; //rand() % 100; // / (float) RAND_MAX;
-    a[i] = rand() % 100;
+    a[i] = rand() % 1000;
 		b[i] = a[i];
 	}
 
@@ -489,7 +496,7 @@ int main(void) {
           break;
       }
   }
-  int s = l * 2; 
+  int s = BLOCKS / 2;
 
   printf ("\nStreaming multiprocessors = %d\n", l);
 	
@@ -498,21 +505,26 @@ int main(void) {
 	cudaEventRecord(start);
 
   /*PRELIMINARY SPLITTER STEP3*********************************************************************/
+  printf("\n*****PRELIMINARY STEP*****\n");
   int *output = get_splitters (a, N, s);
   
   /*STEP 1: Divide the input sequence into equal-sized subsequences. *******************************************
   Each subsequence will be sorted by an independent warp using the bitonic network.*/
+  printf("\n*****STEP1*****\n");
   bitonic_sort_warp<<<blocks, threads>>>(d_a);
 
-
-
+  
   /*STEP 2: Merge all the subsequences produced in step 1 until the parallelism is insufficient.*******************/
   //finchè il parallelismo è insufficiente, ovvero finchè N / offset >= l
   //ad ogni warp merge si inverte input ed output
   bool isAfirst = true;
   blocks.x = BLOCKS / 2;   // Number of blocks
-  l = 8; //TODO rimuovere, è solo per testing!!!!!
-  for(int offset = THREADS * 8; N / offset >= 1 ; offset *= 2){ 
+  //l = 8; //TODO rimuovere, è solo per testing!!!!!
+
+  printf("\n*****STEP2*****\n");
+
+  for(int offset = THREADS * 8; N / offset >= l; offset *= 2){
+    //printf("Step 2 - Offset = %d\n", offset); 
     if(isAfirst)
       bitonic_warp_merge<<<blocks, threads>>>(d_a, d_b, offset);
     else
@@ -529,10 +541,10 @@ int main(void) {
       CHECK(cudaMemcpy(a, d_a, nBytes, cudaMemcpyDeviceToHost));
   }
 
-  
+  /*
   for (int i = 0; i < 2048; i++){
     printf("a[%d] = %d\n", i, a[i]);
-  }
+  }*/
   
   /*STEP 3: Split the large subsequences produced in step 2 into small ones that can be merged independently.*******************/
 
@@ -561,6 +573,8 @@ int main(void) {
   int *a_output;
   a_output = (int*) malloc(nBytes);
 
+  printf("\n*****Step 4*****\n");
+
   for (int i = 0; i < s; i++){ //per ogni colonna
     //printf("\n\n---------------COLONNA---------------------- %d\n\n", i);
     int *cpu_buffer; //buffer on cpu used to build the first s segment with -1 placeholders
@@ -581,7 +595,7 @@ int main(void) {
         s_length = s_indexes[j][i + 1] - s_indexes[j][i]; //calcoliamo la lunghezza del segmento s
       }
       
-      printf("segmento %d, %d: s_length = %d\n", j, i, s_length);
+      //printf("segmento %d, %d: s_length = %d\n", j, i, s_length);
       if(s_length > 128){
           printf("\n\n ERRORE SEGMENTO > 128\n\n");
           break;
@@ -599,23 +613,22 @@ int main(void) {
       }
     }
 
-    
+    /*
     //print 
     if (i == 1){
-      printf("\n**********STAMPA DEL BUFFER PRIMA DELLO STEP2 di s(x, %d)************\n\n", i);
+      //printf("\n**********STAMPA DEL BUFFER PRIMA DELLO STEP2 di s(x, %d)************\n\n", i);
       for (int p = 0; p < l * 128; p++){ 
         printf("cpu_buffer[%d] = %d\n", p, cpu_buffer[p]);
       }
-    }
+    }*/
     
     CHECK(cudaMemcpy(d_buffer, cpu_buffer, l * 128 * sizeof(int), cudaMemcpyHostToDevice));
 
-    /*###########################################TODO PROVARE CON UN ALTRO TIPO DI SORT (CPU?) #######################*/
     //fai step 2 su d_buffer (la colonna)
     blocks.x = l / 2;   // Number of blocks (warps)
     isAfirst = true;
     for(int offset = THREADS * 8; l * 128 / offset >= 1 ; offset *= 2){ 
-      printf("Step 2 presente!!!! offset = %d, blocks.x = %d\n", offset, blocks.x );
+      //printf("Step 2 nello step4: offset = %d, blocks.x = %d\n", offset, blocks.x );
       if(isAfirst)
         bitonic_warp_merge<<<blocks, threads>>>(d_buffer, d_buffer_temp, offset);
       else
@@ -631,6 +644,7 @@ int main(void) {
       CHECK(cudaMemcpy(cpu_buffer, d_buffer, l * 128 * sizeof(int), cudaMemcpyDeviceToHost));
     }
     
+    /*
     printf("\n**********STAMPA DEL BUFFER DOPO LO STEP 2 di s(x, %d)************\n\n", i);
     int num_veri = 0;
     for (int p = 0; p < l * 128; p++){
@@ -638,7 +652,7 @@ int main(void) {
           if (i == 0) printf("cpu_buffer[%d] = %d\n", p, cpu_buffer[p]);
           num_veri++;
         } 
-    }
+    }*/
    
     //printf("global_index nel for, colonna %d = %d\n", i, global_index);
     //printf("num_veri nel for, colonna %d = %d\n", i, num_veri);
@@ -669,10 +683,13 @@ int main(void) {
 	printf("GPU elapsed time: %.5f (sec)\n", milliseconds / 1000);
 
 	// recover data
-  //cudaMemcpy(a, d_a, nBytes, cudaMemcpyDeviceToHost);
+  cudaMemcpy(a, a_output, nBytes, cudaMemcpyHostToHost);
 
 
 	// print & check
+
+  bool errors = false;
+
 	if (N < 100) {
 		printf("GPU:\n");
 		for (int i = 0; i < N; ++i){
@@ -692,10 +709,14 @@ int main(void) {
 		for (int i = 0; i < N; ++i) {
 			if (a_output[i] != b[i]) {
 				printf("ERROR a[%d] != b[%d]  (a[i] = %d  -  b[i] = %d\n", i,i, a_output[i],b[i]);
+        errors = true;
 				break;
 			}
 		}
 	}
+
+  if (!errors)
+    printf("SORTING AVVENUTO CON SUCCESSO!\n");
 
   free(a);
   free(a_output);
