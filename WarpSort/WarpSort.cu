@@ -21,6 +21,24 @@ __global__ void print_array_kernel(int * input, int length);
 
 int get_length (int * array);
 
+void shuffle(int *array, size_t n) {    
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int usec = tv.tv_usec;
+    srand48(usec);
+
+
+    if (n > 1) {
+        size_t i;
+        for (i = n - 1; i > 0; i--) {
+            size_t j = (unsigned int) (drand48()*(i+1));
+            int t = array[j];
+            array[j] = array[i];
+            array[i] = t;
+        }
+    }
+}
+
 /******FUNCTIONS*****/
 
 
@@ -32,7 +50,6 @@ __global__ void print_array_kernel(int * input, int length){
     }
 }
 
-//TODO CAMBIARE SORTING DEGLI ELEMENTI PER NUMELEMENTS > 128
 //Preliminary splitter preparation function
 int * get_splitters (int * input, int N, int s){
   int numElements = s * K;
@@ -456,9 +473,15 @@ int main(void) {
 	// fill data
 	for (int i = 0; i < N; ++i) {
 		//a[i] =  i%5; //rand() % 100; // / (float) RAND_MAX;
-    a[i] = rand() % 1000;
-		b[i] = a[i];
+    //a[i] = rand() % 1000;
+    a[i] = i;
 	}
+  
+  shuffle(a, N);
+
+  for (int i = 0; i < N; i++){
+      b[i] = a [i];
+  }
 
 	// bitonic CPU
 	double cpu_time = seconds();
@@ -507,11 +530,26 @@ int main(void) {
   /*PRELIMINARY SPLITTER STEP3*********************************************************************/
   printf("\n*****PRELIMINARY STEP*****\n");
   int *output = get_splitters (a, N, s);
+
+  /*
+  //Check se il sort del preliminary step è avvenuto correttamente
+  for (int i = 1; i < s; i++){
+      if (output[i] < output[i-1])
+        printf("Preliminary step: errore! -> output[%d] = %d < output[%d] = %d\n", i, i-1, output[i], output[i-1]);
+  }*/
   
   /*STEP 1: Divide the input sequence into equal-sized subsequences. *******************************************
   Each subsequence will be sorted by an independent warp using the bitonic network.*/
   printf("\n*****STEP1*****\n");
   bitonic_sort_warp<<<blocks, threads>>>(d_a);
+
+  /*//Check se il sort dello step 1 è avvenuto correttamente
+  int* temp = (int*) malloc(nBytes);
+  CHECK(cudaMemcpy(temp, d_a, nBytes, cudaMemcpyDeviceToHost));
+  for (int i = 1; i < N; i++){
+      if ((temp[i] < temp[i-1]) && (i % 128 != 0))
+        printf("Step 1: errore! -> temp[%d] = %d < temp[%d] = %d\n", i, i-1, temp[i], temp[i-1]);
+  }*/
 
   
   /*STEP 2: Merge all the subsequences produced in step 1 until the parallelism is insufficient.*******************/
@@ -519,10 +557,10 @@ int main(void) {
   //ad ogni warp merge si inverte input ed output
   bool isAfirst = true;
   blocks.x = BLOCKS / 2;   // Number of blocks
-  //l = 8; //TODO rimuovere, è solo per testing!!!!!
 
   printf("\n*****STEP2*****\n");
 
+  int maxOrderedSegmentSize;
   for(int offset = THREADS * 8; N / offset >= l; offset *= 2){
     //printf("Step 2 - Offset = %d\n", offset); 
     if(isAfirst)
@@ -532,8 +570,9 @@ int main(void) {
     blocks.x = blocks.x / 2;
     
     isAfirst = !isAfirst;
+    maxOrderedSegmentSize = offset;
   }
-  
+
   //recover data
   if(!isAfirst){
       CHECK(cudaMemcpy(a, d_b, nBytes, cudaMemcpyDeviceToHost));
@@ -542,24 +581,34 @@ int main(void) {
   }
 
   /*
+  //Check se il sort dello step 2 è avvenuto correttamente
+  for (int i = 1; i < N; i++){
+      if ((a[i] < a[i-1]) && (i % maxOrderedSegmentSize != 0))
+        printf("Step 2: errore! -> a[%d] = %d < a[%d] = %d\n", i, i-1, a[i], a[i-1]);
+  }*/
+
+  /*
   for (int i = 0; i < 2048; i++){
     printf("a[%d] = %d\n", i, a[i]);
   }*/
   
   /*STEP 3: Split the large subsequences produced in step 2 into small ones that can be merged independently.*******************/
 
+  printf("\n*****STEP3*****\n");
+
   int s_indexes[l][s];
   int temp_i;
   for (int i = 0; i < l; i++){ //per ogni riga 
-    temp_i = N / l * i;
+    temp_i = N / l * i; //indice temporaneo
     int splitCount = 0;
     s_indexes[i][splitCount] = temp_i; //inserisco l'indice per il primo segmento della riga
     splitCount++;
-    //printf("indice %d di l = %d\n", i, s_indexes[i][0]);
-    for(int j = temp_i; splitCount < s ; j++){ //calcolo gli indici dei rimanenti segmenti della riga
-        if (output[splitCount] < a[j]){
+    printf("indice %d di l = %d -> valore = %d\n", i, s_indexes[i][0], a[s_indexes[i][0]]);
+    for(int j = temp_i; splitCount < s ; j++){ //calcolo gli indici dei rimanenti segmenti della riga, scorrendo la riga con j
+        if (output[splitCount] < a[j]){ //confronto con i valori dello splitter
             s_indexes[i][splitCount] = j;
-            //printf("indice %d, %d di l, s = %d\n", i, splitCount, s_indexes[i][splitCount]);  
+            printf("indice %d, %d di l, s = %d -> valore = %d\n", i, splitCount, s_indexes[i][splitCount], 
+                   a[s_indexes[i][splitCount]]);  
             splitCount++;  
         } 
     }
@@ -573,7 +622,7 @@ int main(void) {
   int *a_output;
   a_output = (int*) malloc(nBytes);
 
-  printf("\n*****Step 4*****\n");
+  printf("\n*****STEP4*****\n");
 
   for (int i = 0; i < s; i++){ //per ogni colonna
     //printf("\n\n---------------COLONNA---------------------- %d\n\n", i);
@@ -644,6 +693,13 @@ int main(void) {
       CHECK(cudaMemcpy(cpu_buffer, d_buffer, l * 128 * sizeof(int), cudaMemcpyDeviceToHost));
     }
     
+    
+    //Check se il sort dello step 4.2 è avvenuto correttamente
+    for (int i = 1; i < l * 128; i++){
+        if (cpu_buffer[i] < cpu_buffer[i-1])
+          printf("Step 4.2: errore! -> cpu_buffer[%d] = %d < cpu_buffer[%d] = %d\n", i, cpu_buffer[i], i-1, cpu_buffer[i-1]);
+    }
+
     /*
     printf("\n**********STAMPA DEL BUFFER DOPO LO STEP 2 di s(x, %d)************\n\n", i);
     int num_veri = 0;
@@ -663,6 +719,12 @@ int main(void) {
     for(int z = 0; z < l * 128; z++){
       if (cpu_buffer[z] != -1){
         a_output[global_index] = cpu_buffer[z];
+
+        if ((a_output[global_index] < a_output[global_index - 1]) && global_index > 0){
+          printf("Step 4.3: errore! -> a_output[%d] = %d < a_output[%d] = %d\n", 
+                global_index, a_output[global_index], global_index-1, a_output[global_index-1]);
+        }
+          
         //printf("a[%d] = %d\n", global_index, a_output[global_index]);
         global_index++;
       } 
@@ -673,8 +735,8 @@ int main(void) {
     free(cpu_buffer);
   }
 
-  //printf("\n\nglobal_index = %d\n", global_index);
-  //printf("global_s_lengths = %d\n", global_s_lengths);
+  printf("\n\nglobal_index = %d\n", global_index);
+  printf("global_s_lengths = %d\n", global_s_lengths);
 
 	cudaEventRecord(stop);
 	cudaEventSynchronize(stop);
@@ -710,7 +772,7 @@ int main(void) {
 			if (a_output[i] != b[i]) {
 				printf("ERROR a[%d] != b[%d]  (a[i] = %d  -  b[i] = %d\n", i,i, a_output[i],b[i]);
         errors = true;
-				break;
+				//break;
 			}
 		}
 	}
