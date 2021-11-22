@@ -597,22 +597,43 @@ int main(void) {
   printf("\n*****STEP3*****\n");
 
   int s_indexes[l][s];
-  int temp_i;
-  for (int i = 0; i < l; i++){ //per ogni riga 
-    temp_i = N / l * i; //indice temporaneo
-    int splitCount = 0;
-    s_indexes[i][splitCount] = temp_i; //inserisco l'indice per il primo segmento della riga
-    splitCount++;
-    printf("indice %d di l = %d -> valore = %d\n", i, s_indexes[i][0], a[s_indexes[i][0]]);
-    for(int j = temp_i; splitCount < s ; j++){ //calcolo gli indici dei rimanenti segmenti della riga, scorrendo la riga con j
-        if (output[splitCount] < a[j]){ //confronto con i valori dello splitter
-            s_indexes[i][splitCount] = j;
-            printf("indice %d, %d di l, s = %d -> valore = %d\n", i, splitCount, s_indexes[i][splitCount], 
-                   a[s_indexes[i][splitCount]]);  
-            splitCount++;  
-        } 
+  int index;
+  for (int i = 0; i < l; i++){
+    for (int j = 0; j < s; j++){
+      if (j == 0){
+          s_indexes[i][j] = N / l * i;
+      }
+      else if (j < s){
+        index = N / l * i + 1;
+        while (a[index] < output[j]){
+            index++;
+        }
+        s_indexes[i][j] = index;
+      }
     }
   }
+
+  /*
+  for (int i = 0; i < l; i++){
+      for (int j = 0; j < s; j++){
+          //printf("indice %d, %d di l, s = %d -> valore = %d\n", i, j, s_indexes[i][j], a[s_indexes[i][j]]);
+          if (j - 1 >= 0) {
+              if (a[s_indexes[i][j]] < output[j] ) printf("Errore: primo valore del segmento %d, %d %d è minore dello splitter %d\n", i, j, 
+                                                                         a[s_indexes[i][j]], output[j]);
+          } else {
+              if (a[N / l * i] < 0) printf("Errore: primo valore del segmento %d, %d %d è minore di zero!\n", i, j, 
+                                                                         a[N / l * i]);
+          }
+          
+          if (j + 1 < s){
+            if (a[s_indexes[i][j + 1] - 1] >= output[j + 1]) printf("Errore: ultimo valore del segmento %d, %d %d è maggiore o uguale allo splitter %d\n", i, j, 
+                                                                         a[s_indexes[i][j] - 1], output[j + 1]); 
+          } else {
+            if (a[N / l * i - 1] >= N) printf("Errore: ultimo valore del segmento %d, %d %d è maggiore o uguale allo splitter %d e ha sforato N!\n", i, j, 
+                                                                         a[N / l * i - 1], N);
+          }
+      }
+  }*/
 
   /****STEP 4: *************************************************************************************************/
   
@@ -651,8 +672,10 @@ int main(void) {
       }
       global_s_lengths += s_length;
 
+      //TODO provare a farlo sulla GPU
+      //load_placeholders<<<32, 4>>>(s_length, gpu_buffer)
       int s_index = s_indexes[j][i]; //troviamo la posizione del primo elemento del segmento s
-      for (int k = 0 ; k < 128; k++){ //riempiamo il buffer con -1 e i valori del segmento s
+      for (int k = 0 ; k < 128; k++){ //riempiamo il buffer con -1 e i valori del segmento s 
         if (k < 128 - s_length){
           cpu_buffer[128 * j + k] = -1;
         } else {
@@ -735,8 +758,8 @@ int main(void) {
     free(cpu_buffer);
   }
 
-  printf("\n\nglobal_index = %d\n", global_index);
-  printf("global_s_lengths = %d\n", global_s_lengths);
+  //printf("\n\nglobal_index = %d\n", global_index);
+  //printf("global_s_lengths = %d\n", global_s_lengths);
 
 	cudaEventRecord(stop);
 	cudaEventSynchronize(stop);
@@ -772,7 +795,7 @@ int main(void) {
 			if (a_output[i] != b[i]) {
 				printf("ERROR a[%d] != b[%d]  (a[i] = %d  -  b[i] = %d\n", i,i, a_output[i],b[i]);
         errors = true;
-				//break;
+				break;
 			}
 		}
 	}
