@@ -6,7 +6,7 @@
 #include "../utils/common.h"
 
 #define THREADS 32
-#define BLOCKS 128
+#define BLOCKS 8192
 #define T 64
 #define K 8
 
@@ -591,6 +591,14 @@ int main(void) {
   for (int i = 0; i < 2048; i++){
     printf("a[%d] = %d\n", i, a[i]);
   }*/
+
+  cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	float milliseconds_first_part = 0;
+  cudaEventElapsedTime(&milliseconds_first_part, start, stop);
+
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
   
   /*STEP 3: Split the large subsequences produced in step 2 into small ones that can be merged independently.*******************/
 
@@ -637,6 +645,10 @@ int main(void) {
 
   /****STEP 4: *************************************************************************************************/
   
+  cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+  cudaEventRecord(start);
+
   int s_length, global_index = 0;
   int global_s_lengths = 0;
 
@@ -765,6 +777,7 @@ int main(void) {
 	cudaEventSynchronize(stop);
 	float milliseconds = 0;
 	cudaEventElapsedTime(&milliseconds, start, stop);
+  milliseconds += milliseconds_first_part;
 	printf("GPU elapsed time: %.5f (sec)\n", milliseconds / 1000);
 
 	// recover data
