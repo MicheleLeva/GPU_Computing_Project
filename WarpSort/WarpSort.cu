@@ -523,13 +523,25 @@ int main(void) {
 
   printf ("\nStreaming multiprocessors = %d\n", l);
 	
+  cudaEvent_t start_step, stop_step;
+	cudaEventCreate(&start_step);
+  cudaEventCreate(&stop_step);
+  float milliseconds_step = 0;
   
+
   // start computation
 	cudaEventRecord(start);
 
   /*PRELIMINARY SPLITTER STEP3*********************************************************************/
   printf("\n*****PRELIMINARY STEP*****\n");
+  cudaEventRecord(start_step);
+
   int *output = get_splitters (a, N, s);
+
+  cudaEventRecord(stop_step);
+	cudaEventSynchronize(stop_step);
+  cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
+  printf("Preliminary step time: %.5f (sec)\n", milliseconds_step / 1000);
 
   /*
   //Check se il sort del preliminary step è avvenuto correttamente
@@ -541,7 +553,15 @@ int main(void) {
   /*STEP 1: Divide the input sequence into equal-sized subsequences. *******************************************
   Each subsequence will be sorted by an independent warp using the bitonic network.*/
   printf("\n*****STEP1*****\n");
+
+  cudaEventRecord(start_step);
+
   bitonic_sort_warp<<<blocks, threads>>>(d_a);
+
+  cudaEventRecord(stop_step);
+	cudaEventSynchronize(stop_step);
+  cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
+  printf("Step 1 time: %.5f (sec)\n", milliseconds_step / 1000);
 
   /*//Check se il sort dello step 1 è avvenuto correttamente
   int* temp = (int*) malloc(nBytes);
@@ -560,6 +580,8 @@ int main(void) {
 
   printf("\n*****STEP2*****\n");
 
+  cudaEventRecord(start_step);
+
   int maxOrderedSegmentSize;
   for(int offset = THREADS * 8; N / offset >= l; offset *= 2){
     //printf("Step 2 - Offset = %d\n", offset); 
@@ -572,6 +594,7 @@ int main(void) {
     isAfirst = !isAfirst;
     maxOrderedSegmentSize = offset;
   }
+  
 
   //recover data
   if(!isAfirst){
@@ -579,6 +602,11 @@ int main(void) {
   } else {
       CHECK(cudaMemcpy(a, d_a, nBytes, cudaMemcpyDeviceToHost));
   }
+
+  cudaEventRecord(stop_step);
+	cudaEventSynchronize(stop_step);
+  cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
+  printf("Step 2 time: %.5f (sec)\n", milliseconds_step / 1000);
 
   /*
   //Check se il sort dello step 2 è avvenuto correttamente
@@ -592,18 +620,16 @@ int main(void) {
     printf("a[%d] = %d\n", i, a[i]);
   }*/
 
-  cudaEventRecord(stop);
-	cudaEventSynchronize(stop);
-	float milliseconds_first_part = 0;
-  cudaEventElapsedTime(&milliseconds_first_part, start, stop);
-
-  cudaEventDestroy(start);
-  cudaEventDestroy(stop);
   
   /*STEP 3: Split the large subsequences produced in step 2 into small ones that can be merged independently.*******************/
 
   printf("\n*****STEP3*****\n");
 
+  cudaEventRecord(start_step);
+
+  //TODO come parallelizzare? 
+  //se assegnassimo ad ogni cella dell'array da ordinare un kernel, come quest'ultimo fa a sapere se è il primo elemento
+  //del segmento successivo?
   int s_indexes[l][s];
   int index;
   for (int i = 0; i < l; i++){
@@ -620,6 +646,11 @@ int main(void) {
       }
     }
   }
+
+  cudaEventRecord(stop_step);
+	cudaEventSynchronize(stop_step);
+  cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
+  printf("Step 3 time: %.5f (sec)\n", milliseconds_step / 1000);
 
   /*
   for (int i = 0; i < l; i++){
@@ -645,11 +676,10 @@ int main(void) {
 
   /****STEP 4: *************************************************************************************************/
   
-  cudaEventCreate(&start);
-	cudaEventCreate(&stop);
-  cudaEventRecord(start);
+  cudaEventRecord(start_step);
 
   int s_length, global_index = 0;
+  int s_lengths[l];
   int global_s_lengths = 0;
 
   int *a_output;
@@ -685,7 +715,7 @@ int main(void) {
       global_s_lengths += s_length;
 
       //TODO provare a farlo sulla GPU
-      //load_placeholders<<<32, 4>>>(s_length, gpu_buffer)
+      //load_placeholders<<<32, 4>>>(s_length, gpu_buffer, a)
       int s_index = s_indexes[j][i]; //troviamo la posizione del primo elemento del segmento s
       for (int k = 0 ; k < 128; k++){ //riempiamo il buffer con -1 e i valori del segmento s 
         if (k < 128 - s_length){
@@ -772,17 +802,21 @@ int main(void) {
 
   //printf("\n\nglobal_index = %d\n", global_index);
   //printf("global_s_lengths = %d\n", global_s_lengths);
-
-	cudaEventRecord(stop);
-	cudaEventSynchronize(stop);
-	float milliseconds = 0;
-	cudaEventElapsedTime(&milliseconds, start, stop);
-  milliseconds += milliseconds_first_part;
-	printf("GPU elapsed time: %.5f (sec)\n", milliseconds / 1000);
-
+  
 	// recover data
   cudaMemcpy(a, a_output, nBytes, cudaMemcpyHostToHost);
 
+  cudaEventRecord(stop_step);
+	cudaEventSynchronize(stop_step);
+  cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
+  printf("Step 4 time: %.5f (sec)\n", milliseconds_step / 1000);
+
+  //total elapsed time print
+  cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	float milliseconds = 0;
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	printf("GPU elapsed time: %.5f (sec)\n", milliseconds / 1000);
 
 	// print & check
 
