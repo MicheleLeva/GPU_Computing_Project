@@ -6,7 +6,7 @@
 #include "../utils/common.h"
 
 #define THREADS 32
-#define BLOCKS 8192
+#define BLOCKS 32
 #define T 64
 #define K 8
 
@@ -18,6 +18,10 @@ __global__ void bitonic_sort_warp(int *keyin); //step1
 __global__ void bitonic_warp_merge(int * keyin, int * output, int offset); //step2
 
 __global__ void print_array_kernel(int * input, int length);
+
+__global__ void load_placeholders(int * s_lengths, int * d_buffer, int * a, int * s_indexesByColumn);
+
+__global__ void loadOutput(int * d_buffer, int * d_b, int l, int columnLength, int global_index);
 
 int get_length (int * array);
 
@@ -403,6 +407,44 @@ __global__ void bitonic_warp_merge(int * keyin, int * output, int offset){
 
 }
 
+//Used in step 4 to load -1
+__global__ void load_placeholders(int * s_lengths, int * d_buffer, int * a, int * s_indexesByColumn){
+    
+  unsigned int id = threadIdx.x + blockDim.x * blockIdx.x;
+  unsigned int subseq = blockIdx.x; //which segment the kernel is working on
+  int index = s_indexesByColumn[subseq] + threadIdx.x - (128 - s_lengths[subseq]);
+
+  /*
+  if (threadIdx.x == 0)
+    printf("Load_placeholders subseq: %d , threadIdx.x = %d, s_indexesByColumn = %d, s_lengths[subseq] = %d\n",
+           subseq, threadIdx.x, index, s_lengths[subseq]);
+  //printf("Load_placeholders subseq: %d , id = %d, index = %d\n", subseq, id, index);
+  */
+
+  if (threadIdx.x < 128 - s_lengths[subseq])
+    d_buffer[id] = -1;
+  else{
+    d_buffer[id] = a[index];
+  }
+    
+}
+
+__global__ void loadOutput(int * d_buffer, int * d_b, int l, int columnLength, int global_index){
+
+  unsigned int id = threadIdx.x + blockDim.x * blockIdx.x;
+  int local_index = id - ( l * 128 - columnLength);
+  int index = global_index + local_index;
+  
+  if (id >= (l * 128 - columnLength)){
+    if (local_index == 0)
+      printf("Load_output id = %d, l = %d, columnLength = %d, global_index = %d, index = %d\n",
+          id, l, columnLength, global_index, index);
+    d_b[index] = d_buffer[id];
+  }
+    
+  
+}
+
 
 /*******FUNZIONI DEL PROFESSORE*********/
 
@@ -500,16 +542,6 @@ int main(void) {
 	dim3 blocks(BLOCKS, 1);   // Number of blocks
   dim3 threads(THREADS, 1); // Number of threads
 	
-  /*
-	int j, k;
-  // external loop on comparators of size k
-  for (k = 2; k <= N; k <<= 1) {
-    // internal loop for comparator internal stages
-    for (j = k >> 1; j > 0; j = j >> 1)
-      bitonic_sort_step<<<blocks, threads * 4>>>(d_a, j, k);
-  }
-  */
-
   cudaDeviceProp deviceProp;
 	cudaGetDeviceProperties(&deviceProp, 0);
   int l = deviceProp.multiProcessorCount; //numero di streaming multiprocessor della GPU
@@ -679,53 +711,69 @@ int main(void) {
   cudaEventRecord(start_step);
 
   int s_length, global_index = 0;
-  int s_lengths[l];
+  int s_lengths[l], s_indexesByColumn[l];
   int global_s_lengths = 0;
 
   int *a_output;
   a_output = (int*) malloc(nBytes);
+  CHECK(cudaMemcpy(d_a, a, nBytes, cudaMemcpyHostToDevice));
+  CHECK(cudaMemcpy(d_b, a, nBytes, cudaMemcpyHostToDevice));
 
   printf("\n*****STEP4*****\n");
 
+  //TODO possibile parallelizzazione pure in questo caso?
   for (int i = 0; i < s; i++){ //per ogni colonna
     //printf("\n\n---------------COLONNA---------------------- %d\n\n", i);
     int *cpu_buffer; //buffer on cpu used to build the first s segment with -1 placeholders
     cpu_buffer = (int*) malloc(l * 128 * sizeof(int));
+    int columnLength = 0;
 
     int *d_buffer, *d_buffer_temp;
     CHECK(cudaMalloc((void**) &d_buffer, l * 128 * sizeof(int)));
     CHECK(cudaMalloc((void**) &d_buffer_temp, l * 128 * sizeof(int)));
 
+    //TODO come si può ottimizzare ulteriormente?
     //copia dei valori dei segmenti s in un buffer
     for (int j = 0; j < l; j++){
       if (i + 1 >= s){
         if (j + 1 >= l)
-          s_length = N - s_indexes[j][i]; //caso limite ultimo segmento
+          s_lengths[j] = N - s_indexes[j][i]; //caso limite ultimo segmento
         else
-          s_length = s_indexes[j + 1][0] - s_indexes[j][i]; //ultimo segmento della riga
+          s_lengths[j] = s_indexes[j + 1][0] - s_indexes[j][i]; //ultimo segmento della riga
       } else{
-        s_length = s_indexes[j][i + 1] - s_indexes[j][i]; //calcoliamo la lunghezza del segmento s
+        s_lengths[j] = s_indexes[j][i + 1] - s_indexes[j][i]; //calcoliamo la lunghezza del segmento s
       }
-      
-      //printf("segmento %d, %d: s_length = %d\n", j, i, s_length);
-      if(s_length > 128){
+
+      s_indexesByColumn[j] = s_indexes[j][i];
+
+      //printf("segmento %d, %d: s_length = %d\n", j, i, s_lengths[j]);
+      if(s_lengths[j] > 128){
           printf("\n\n ERRORE SEGMENTO > 128\n\n");
           break;
       }
-      global_s_lengths += s_length;
 
-      //TODO provare a farlo sulla GPU
-      //load_placeholders<<<32, 4>>>(s_length, gpu_buffer, a)
-      int s_index = s_indexes[j][i]; //troviamo la posizione del primo elemento del segmento s
-      for (int k = 0 ; k < 128; k++){ //riempiamo il buffer con -1 e i valori del segmento s 
-        if (k < 128 - s_length){
-          cpu_buffer[128 * j + k] = -1;
-        } else {
-          cpu_buffer[128 * j + k] = a[s_index];
-          s_index++;
-        }  
-      }
+      columnLength += s_lengths[j];
+      //global_s_lengths += s_lengths[j];
     }
+
+    int * gpu_colIndexes, *gpu_s_lengths;
+    CHECK(cudaMalloc((void**) &gpu_colIndexes, sizeof(int) * l));
+    CHECK(cudaMalloc((void**) &gpu_s_lengths, sizeof(int) * l));
+    CHECK(cudaMemcpy(gpu_colIndexes, s_indexesByColumn, sizeof(int) * l, cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(gpu_s_lengths, s_lengths, sizeof(int) * l, cudaMemcpyHostToDevice));
+
+    load_placeholders<<<l, 128>>>(gpu_s_lengths, d_buffer, d_a, gpu_colIndexes);
+    /*
+    int s_index = s_indexes[j][i]; //troviamo la posizione del primo elemento del segmento s
+    for (int k = 0 ; k < 128; k++){ //riempiamo il buffer con -1 e i valori del segmento s 
+      if (k < 128 - s_length){
+        cpu_buffer[128 * j + k] = -1;
+      } else {
+        cpu_buffer[128 * j + k] = a[s_index];
+        s_index++;
+      }  
+    }*/
+    
 
     /*
     //print 
@@ -736,7 +784,7 @@ int main(void) {
       }
     }*/
     
-    CHECK(cudaMemcpy(d_buffer, cpu_buffer, l * 128 * sizeof(int), cudaMemcpyHostToDevice));
+    //CHECK(cudaMemcpy(d_buffer, cpu_buffer, l * 128 * sizeof(int), cudaMemcpyHostToDevice));
 
     //fai step 2 su d_buffer (la colonna)
     blocks.x = l / 2;   // Number of blocks (warps)
@@ -752,12 +800,13 @@ int main(void) {
       isAfirst = !isAfirst;
     }
     
+    /*
+    //Checks and prints
     if(!isAfirst){
       CHECK(cudaMemcpy(cpu_buffer, d_buffer_temp, l * 128 * sizeof(int), cudaMemcpyDeviceToHost));
     } else {
       CHECK(cudaMemcpy(cpu_buffer, d_buffer, l * 128 * sizeof(int), cudaMemcpyDeviceToHost));
     }
-    
     
     //Check se il sort dello step 4.2 è avvenuto correttamente
     for (int i = 1; i < l * 128; i++){
@@ -765,7 +814,6 @@ int main(void) {
           printf("Step 4.2: errore! -> cpu_buffer[%d] = %d < cpu_buffer[%d] = %d\n", i, cpu_buffer[i], i-1, cpu_buffer[i-1]);
     }
 
-    /*
     printf("\n**********STAMPA DEL BUFFER DOPO LO STEP 2 di s(x, %d)************\n\n", i);
     int num_veri = 0;
     for (int p = 0; p < l * 128; p++){
@@ -774,12 +822,20 @@ int main(void) {
           num_veri++;
         } 
     }*/
+
+    if(!isAfirst){
+      loadOutput<<<l, 128>>>(d_buffer_temp, d_b, l, columnLength, global_index);
+    } else {
+      loadOutput<<<l, 128>>>(d_buffer, d_b, l, columnLength, global_index);
+    }
+    global_index += columnLength;
    
     //printf("global_index nel for, colonna %d = %d\n", i, global_index);
     //printf("num_veri nel for, colonna %d = %d\n", i, num_veri);
     //printf("global_s_lengths nel for, colonna %d = %d\n", i, global_s_lengths);
     
-    
+    /*
+    //TODO provare a farlo su GPU
     //salvo il buffer ordinato sull'output finale a rimuovendo i placeholder -1
     for(int z = 0; z < l * 128; z++){
       if (cpu_buffer[z] != -1){
@@ -793,7 +849,7 @@ int main(void) {
         //printf("a[%d] = %d\n", global_index, a_output[global_index]);
         global_index++;
       } 
-    }
+    }*/
 
     cudaFree(d_buffer); 
     cudaFree(d_buffer_temp); 
