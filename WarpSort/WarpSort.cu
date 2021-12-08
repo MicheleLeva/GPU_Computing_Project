@@ -6,7 +6,7 @@
 #include "../utils/common.h"
 
 #define THREADS 32
-#define BLOCKS 32
+#define BLOCKS 8192
 #define T 64
 #define K 8
 
@@ -429,16 +429,27 @@ __global__ void load_placeholders(int * s_lengths, int * d_buffer, int * a, int 
     
 }
 
+//TODO fix
 __global__ void loadOutput(int * d_buffer, int * d_b, int l, int columnLength, int global_index){
 
   unsigned int id = threadIdx.x + blockDim.x * blockIdx.x;
   int local_index = id - ( l * 128 - columnLength);
   int index = global_index + local_index;
-  
+  /*
+  if (local_index == -1)
+        printf("Load_output local index = -1, id = %d, l = %d, columnLength = %d, global_index = %d, index = %d, d_buffer[%d] = %d\n", 
+              id, l, columnLength, global_index, index, id, d_buffer[id]);*/
+
   if (id >= (l * 128 - columnLength)){
+    /*
     if (local_index == 0)
-      printf("Load_output id = %d, l = %d, columnLength = %d, global_index = %d, index = %d\n",
-          id, l, columnLength, global_index, index);
+      printf("Load_output local index = 0, id = %d, l = %d, columnLength = %d, global_index = %d, index = %d, d_buffer[%d] = %d\n", 
+             id, l, columnLength, global_index, index, id, d_buffer[id]);
+    if (local_index == columnLength - 1)
+      printf("Load_output local index = columnLength - 1, id = %d, l = %d, columnLength = %d, global_index = %d, index = %d, d_buffer[%d] = %d\n", 
+             id, l, columnLength, global_index, index, id, d_buffer[id]);
+    */
+    //printf("dbuffer[%d] = %d\n", id, d_buffer[id]);
     d_b[index] = d_buffer[id];
   }
     
@@ -860,7 +871,7 @@ int main(void) {
   //printf("global_s_lengths = %d\n", global_s_lengths);
   
 	// recover data
-  cudaMemcpy(a, a_output, nBytes, cudaMemcpyHostToHost);
+  cudaMemcpy(a_output, d_b, nBytes, cudaMemcpyDeviceToHost);
 
   cudaEventRecord(stop_step);
 	cudaEventSynchronize(stop_step);
@@ -895,8 +906,9 @@ int main(void) {
 	else {
     
 		for (int i = 0; i < N; ++i) {
+      //printf("a[%d] = %d, b[%d] = %d)\n", i, a_output[i], i, b[i]);
 			if (a_output[i] != b[i]) {
-				printf("ERROR a[%d] != b[%d]  (a[i] = %d  -  b[i] = %d\n", i,i, a_output[i],b[i]);
+				printf("ERROR a[%d] != b[%d]  (a[i] = %d  -  b[i] = %d)\n", i,i, a_output[i],b[i]);
         errors = true;
 				break;
 			}
