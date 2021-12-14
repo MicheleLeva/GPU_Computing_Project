@@ -23,6 +23,8 @@ __global__ void load_placeholders(int * s_lengths, int * d_buffer, int * a, int 
 
 __global__ void loadOutput(int * d_buffer, int * d_b, int l, int columnLength, int global_index);
 
+__global__ void loadSplitterMatrix(int ** rowSplitters, int * splitters, int * d_a, int N, int l, int s);
+
 int get_length (int * array);
 
 void shuffle(int *array, size_t n) {    
@@ -407,6 +409,25 @@ __global__ void bitonic_warp_merge(int * keyin, int * output, int offset){
 
 }
 
+//STEP 3:
+__global__ void loadSplitterMatrix(int ** rowSplitters, int * splitters, int * d_a, int N, int l, int s){
+  int index;
+  int i = threadIdx.x;
+  for (int j = 0; j < s; j++){
+    if (j == 0){
+        rowSplitters[i][j] = N / l * i;
+    }
+    else if (j < s){
+      index = N / l * i + 1;
+      while (d_a[index] < splitters[j]){
+          index++;
+      }
+      rowSplitters[i][j] = index;
+    }
+  }
+}
+
+
 //Used in step 4 to load -1
 __global__ void load_placeholders(int * s_lengths, int * d_buffer, int * a, int * s_indexesByColumn){
     
@@ -429,7 +450,6 @@ __global__ void load_placeholders(int * s_lengths, int * d_buffer, int * a, int 
     
 }
 
-//TODO fix
 __global__ void loadOutput(int * d_buffer, int * d_b, int l, int columnLength, int global_index){
 
   unsigned int id = threadIdx.x + blockDim.x * blockIdx.x;
@@ -576,6 +596,7 @@ int main(void) {
 	cudaEventRecord(start);
 
   /*PRELIMINARY SPLITTER STEP3*********************************************************************/
+  //si trovano gli splitter che poi verranno usati nello step 3
   printf("\n*****PRELIMINARY STEP*****\n");
   cudaEventRecord(start_step);
 
@@ -616,8 +637,6 @@ int main(void) {
 
   
   /*STEP 2: Merge all the subsequences produced in step 1 until the parallelism is insufficient.*******************/
-  //finchè il parallelismo è insufficiente, ovvero finchè N / offset >= l
-  //ad ogni warp merge si inverte input ed output
   bool isAfirst = true;
   blocks.x = BLOCKS / 2;   // Number of blocks
 
@@ -626,6 +645,8 @@ int main(void) {
   cudaEventRecord(start_step);
 
   int maxOrderedSegmentSize;
+  //finchè il parallelismo è insufficiente, ovvero finchè N / offset >= l
+  //ad ogni warp merge si inverte input ed output raddoppiando la lunghezza del segmento che il warp deve ordinare
   for(int offset = THREADS * 8; N / offset >= l; offset *= 2){
     //printf("Step 2 - Offset = %d\n", offset); 
     if(isAfirst)
@@ -674,6 +695,7 @@ int main(void) {
   //se assegnassimo ad ogni cella dell'array da ordinare un kernel, come quest'ultimo fa a sapere se è il primo elemento
   //del segmento successivo?
   int s_indexes[l][s];
+  
   int index;
   for (int i = 0; i < l; i++){
     for (int j = 0; j < s; j++){
@@ -689,6 +711,34 @@ int main(void) {
       }
     }
   }
+  
+  //versione GPU 
+  //TODO da rivedere, come si allocano e usano gli array 2D su GPU?
+  //si possono allocare l blocchi da 1 kernel per eviare la warp divergence?
+  /*
+  int** rowSplitters;
+  //CHECK(cudaMalloc((void***) &rowSplitters, s * l * sizeof(int)));
+  CHECK(cudaMalloc((void***) &rowSplitters, l * sizeof(int)));
+  for (int i = 0; i < )
+  size_t matrixPitch;
+  CHECK(cudaMallocPitch(&rowSplitters, &matrixPitch, s * sizeof(int), l);)
+  int* splitters;
+  CHECK(cudaMalloc((void**) &splitters, s * sizeof(int)));
+  CHECK(cudaMemcpy(splitters, output, sizeof(int) * s, cudaMemcpyHostToDevice));
+
+  CHECK(cudaMemcpy(d_a, a, nBytes, cudaMemcpyHostToDevice));
+
+  printf("prima di loadSplitterMatrix\n");
+  loadSplitterMatrix<<<1, l>>>(rowSplitters, splitters, d_a, N, l, s);
+  printf("dopo loadSplitterMatrix\n");
+
+  for (int i = 0; i < l; i++){
+    //TODO si può copiare da array GPU a riga di matrice CPU?
+    print_array_kernel<<<1, 1>>>(rowSplitters[i], s);
+    CHECK(cudaMemcpy(s_indexes[i], rowSplitters[i], s, cudaMemcpyDeviceToHost));
+  }
+  */
+  
 
   cudaEventRecord(stop_step);
 	cudaEventSynchronize(stop_step);
@@ -721,7 +771,7 @@ int main(void) {
   
   cudaEventRecord(start_step);
 
-  int s_length, global_index = 0;
+  int global_index = 0;
   int s_lengths[l], s_indexesByColumn[l];
   int global_s_lengths = 0;
 
@@ -732,9 +782,8 @@ int main(void) {
 
   printf("\n*****STEP4*****\n");
 
-  //TODO possibile parallelizzazione pure in questo caso?
+  //TODO possibile parallelizzazione pure in questo caso? da lavoro su una colonna alla volta a tutta la matrice in una volta
   for (int i = 0; i < s; i++){ //per ogni colonna
-    //printf("\n\n---------------COLONNA---------------------- %d\n\n", i);
     int *cpu_buffer; //buffer on cpu used to build the first s segment with -1 placeholders
     cpu_buffer = (int*) malloc(l * 128 * sizeof(int));
     int columnLength = 0;
@@ -744,7 +793,7 @@ int main(void) {
     CHECK(cudaMalloc((void**) &d_buffer_temp, l * 128 * sizeof(int)));
 
     //TODO come si può ottimizzare ulteriormente?
-    //copia dei valori dei segmenti s in un buffer
+    //copia delle lunghezze dei segmenti s in un buffer s_lengths e controllo che non sforino i 128 elementi
     for (int j = 0; j < l; j++){
       if (i + 1 >= s){
         if (j + 1 >= l)
@@ -772,32 +821,13 @@ int main(void) {
     CHECK(cudaMalloc((void**) &gpu_s_lengths, sizeof(int) * l));
     CHECK(cudaMemcpy(gpu_colIndexes, s_indexesByColumn, sizeof(int) * l, cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(gpu_s_lengths, s_lengths, sizeof(int) * l, cudaMemcpyHostToDevice));
-
-    load_placeholders<<<l, 128>>>(gpu_s_lengths, d_buffer, d_a, gpu_colIndexes);
-    /*
-    int s_index = s_indexes[j][i]; //troviamo la posizione del primo elemento del segmento s
-    for (int k = 0 ; k < 128; k++){ //riempiamo il buffer con -1 e i valori del segmento s 
-      if (k < 128 - s_length){
-        cpu_buffer[128 * j + k] = -1;
-      } else {
-        cpu_buffer[128 * j + k] = a[s_index];
-        s_index++;
-      }  
-    }*/
     
-
-    /*
-    //print 
-    if (i == 1){
-      //printf("\n**********STAMPA DEL BUFFER PRIMA DELLO STEP2 di s(x, %d)************\n\n", i);
-      for (int p = 0; p < l * 128; p++){ 
-        printf("cpu_buffer[%d] = %d\n", p, cpu_buffer[p]);
-      }
-    }*/
+    //caricamento dei segmenti sul buffer d_buffer assieme ai placeholder -1
+    load_placeholders<<<l, 128>>>(gpu_s_lengths, d_buffer, d_a, gpu_colIndexes);
     
     //CHECK(cudaMemcpy(d_buffer, cpu_buffer, l * 128 * sizeof(int), cudaMemcpyHostToDevice));
 
-    //fai step 2 su d_buffer (la colonna)
+    //riordino di d_buffer (colonna) attraverso bitonic_warp_merge come in step 2
     blocks.x = l / 2;   // Number of blocks (warps)
     isAfirst = true;
     for(int offset = THREADS * 8; l * 128 / offset >= 1 ; offset *= 2){ 
@@ -811,29 +841,7 @@ int main(void) {
       isAfirst = !isAfirst;
     }
     
-    /*
-    //Checks and prints
-    if(!isAfirst){
-      CHECK(cudaMemcpy(cpu_buffer, d_buffer_temp, l * 128 * sizeof(int), cudaMemcpyDeviceToHost));
-    } else {
-      CHECK(cudaMemcpy(cpu_buffer, d_buffer, l * 128 * sizeof(int), cudaMemcpyDeviceToHost));
-    }
-    
-    //Check se il sort dello step 4.2 è avvenuto correttamente
-    for (int i = 1; i < l * 128; i++){
-        if (cpu_buffer[i] < cpu_buffer[i-1])
-          printf("Step 4.2: errore! -> cpu_buffer[%d] = %d < cpu_buffer[%d] = %d\n", i, cpu_buffer[i], i-1, cpu_buffer[i-1]);
-    }
-
-    printf("\n**********STAMPA DEL BUFFER DOPO LO STEP 2 di s(x, %d)************\n\n", i);
-    int num_veri = 0;
-    for (int p = 0; p < l * 128; p++){
-        if (cpu_buffer[p] > -1){
-          if (i == 0) printf("cpu_buffer[%d] = %d\n", p, cpu_buffer[p]);
-          num_veri++;
-        } 
-    }*/
-
+    //copia della colonna riordinata su output d_b
     if(!isAfirst){
       loadOutput<<<l, 128>>>(d_buffer_temp, d_b, l, columnLength, global_index);
     } else {
@@ -845,23 +853,6 @@ int main(void) {
     //printf("num_veri nel for, colonna %d = %d\n", i, num_veri);
     //printf("global_s_lengths nel for, colonna %d = %d\n", i, global_s_lengths);
     
-    /*
-    //TODO provare a farlo su GPU
-    //salvo il buffer ordinato sull'output finale a rimuovendo i placeholder -1
-    for(int z = 0; z < l * 128; z++){
-      if (cpu_buffer[z] != -1){
-        a_output[global_index] = cpu_buffer[z];
-
-        if ((a_output[global_index] < a_output[global_index - 1]) && global_index > 0){
-          printf("Step 4.3: errore! -> a_output[%d] = %d < a_output[%d] = %d\n", 
-                global_index, a_output[global_index], global_index-1, a_output[global_index-1]);
-        }
-          
-        //printf("a[%d] = %d\n", global_index, a_output[global_index]);
-        global_index++;
-      } 
-    }*/
-
     cudaFree(d_buffer); 
     cudaFree(d_buffer_temp); 
     free(cpu_buffer);
