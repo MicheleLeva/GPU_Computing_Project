@@ -10,7 +10,6 @@
 #define T 64
 #define K 8
 
-
 int * get_splitters (int * input, int N, int s); //preliminary
 
 __global__ void bitonic_sort_warp(int *keyin); //step1
@@ -23,7 +22,7 @@ __global__ void load_placeholders(int * s_lengths, int * d_buffer, int * a, int 
 
 __global__ void loadOutput(int * d_buffer, int * d_b, int l, int columnLength, int global_index);
 
-__global__ void loadSplitterMatrix(int ** rowSplitters, int * splitters, int * d_a, int N, int l, int s);
+__global__ void loadSplitterMatrix(int * gpu_indexMatrix, int * splitters, int * d_a, int N, int l, int s);
 
 int get_length (int * array);
 
@@ -410,21 +409,25 @@ __global__ void bitonic_warp_merge(int * keyin, int * output, int offset){
 }
 
 //STEP 3:
-__global__ void loadSplitterMatrix(int ** rowSplitters, int * splitters, int * d_a, int N, int l, int s){
-  int index;
-  int i = threadIdx.x;
-  for (int j = 0; j < s; j++){
-    if (j == 0){
-        rowSplitters[i][j] = N / l * i;
-    }
-    else if (j < s){
-      index = N / l * i + 1;
-      while (d_a[index] < splitters[j]){
-          index++;
-      }
-      rowSplitters[i][j] = index;
-    }
+__global__ void loadSplitterMatrix(int * gpu_indexMatrix, int * splitters, int * d_a, int N, int l, int s){
+
+  int n = N / l;
+  int row = blockIdx.x;
+  int splitterIndex = threadIdx.x;
+
+  __shared__ int sharedRow[n];
+
+  int len = n / s;
+
+  //caricamento della row nella memoria shared
+  //TODO vedere se la roba sotto funziona
+  for (int i = 0; i < len; i++){
+      sharedRow[splitterIndex * len + i] = d_a[n * row + splitterIndex * len + i];
   }
+
+  //ricerca dell'indice corrispondente allo splitter
+  //TODO
+  
 }
 
 
@@ -691,11 +694,9 @@ int main(void) {
 
   cudaEventRecord(start_step);
 
-  //TODO come parallelizzare? 
-  //se assegnassimo ad ogni cella dell'array da ordinare un kernel, come quest'ultimo fa a sapere se è il primo elemento
-  //del segmento successivo?
   int s_indexes[l][s];
-  
+
+  /*
   int index;
   for (int i = 0; i < l; i++){
     for (int j = 0; j < s; j++){
@@ -710,18 +711,14 @@ int main(void) {
         s_indexes[i][j] = index;
       }
     }
-  }
+  }*/
   
   //versione GPU 
-  //TODO da rivedere, come si allocano e usano gli array 2D su GPU?
-  //si possono allocare l blocchi da 1 kernel per eviare la warp divergence?
-  /*
-  int** rowSplitters;
-  //CHECK(cudaMalloc((void***) &rowSplitters, s * l * sizeof(int)));
-  CHECK(cudaMalloc((void***) &rowSplitters, l * sizeof(int)));
-  for (int i = 0; i < )
-  size_t matrixPitch;
-  CHECK(cudaMallocPitch(&rowSplitters, &matrixPitch, s * sizeof(int), l);)
+  //TODO SISTEMARE
+  //allocazione della matrice degli indici
+  int* gpu_indexMatrix;
+  CHECK(cudaMalloc((void**) &gpu_indexMatrix, s * l * sizeof(int)));
+
   int* splitters;
   CHECK(cudaMalloc((void**) &splitters, s * sizeof(int)));
   CHECK(cudaMemcpy(splitters, output, sizeof(int) * s, cudaMemcpyHostToDevice));
@@ -729,16 +726,15 @@ int main(void) {
   CHECK(cudaMemcpy(d_a, a, nBytes, cudaMemcpyHostToDevice));
 
   printf("prima di loadSplitterMatrix\n");
-  loadSplitterMatrix<<<1, l>>>(rowSplitters, splitters, d_a, N, l, s);
+  loadSplitterMatrix<<<1, l>>>(gpu_indexMatrix, splitters, d_a, N, l, s);
   printf("dopo loadSplitterMatrix\n");
 
-  for (int i = 0; i < l; i++){
-    //TODO si può copiare da array GPU a riga di matrice CPU?
-    print_array_kernel<<<1, 1>>>(rowSplitters[i], s);
-    CHECK(cudaMemcpy(s_indexes[i], rowSplitters[i], s, cudaMemcpyDeviceToHost));
+  for (int i = 0; i < l; i++){}
+    print_array_kernel<<<1, 1>>>(gpu_indexMatrix[i], s);
+    CHECK(cudaMemcpy(s_indexes[i], gpu_indexMatrix[i], s, cudaMemcpyDeviceToHost));
   }
-  */
   
+
 
   cudaEventRecord(stop_step);
 	cudaEventSynchronize(stop_step);
@@ -782,7 +778,7 @@ int main(void) {
 
   printf("\n*****STEP4*****\n");
 
-  //TODO possibile parallelizzazione pure in questo caso? da lavoro su una colonna alla volta a tutta la matrice in una volta
+  //TODO (forse) possibile parallelizzazione pure in questo caso? da lavoro su una colonna alla volta a tutta la matrice in una volta + rimozione padding?
   for (int i = 0; i < s; i++){ //per ogni colonna
     int *cpu_buffer; //buffer on cpu used to build the first s segment with -1 placeholders
     cpu_buffer = (int*) malloc(l * 128 * sizeof(int));
@@ -792,7 +788,7 @@ int main(void) {
     CHECK(cudaMalloc((void**) &d_buffer, l * 128 * sizeof(int)));
     CHECK(cudaMalloc((void**) &d_buffer_temp, l * 128 * sizeof(int)));
 
-    //TODO come si può ottimizzare ulteriormente?
+    //TODO portare sulla GPU per sfruttare la matrice degl indici GPU
     //copia delle lunghezze dei segmenti s in un buffer s_lengths e controllo che non sforino i 128 elementi
     for (int j = 0; j < l; j++){
       if (i + 1 >= s){
