@@ -6,7 +6,7 @@
 #include "../utils/common.h"
 
 #define THREADS 32
-#define BLOCKS 8192
+#define BLOCKS 64
 #define T 64
 #define K 8
 
@@ -17,6 +17,8 @@ __global__ void bitonic_sort_warp(int *keyin); //step1
 __global__ void bitonic_warp_merge(int * keyin, int * output, int offset); //step2
 
 __global__ void print_array_kernel(int * input, int length);
+
+__global__ void printMatrix(int * matrix, int * a, int rows, int columns);
 
 __global__ void load_placeholders(int * s_lengths, int * d_buffer, int * a, int * s_indexesByColumn);
 
@@ -52,6 +54,15 @@ void shuffle(int *array, size_t n) {
 __global__ void print_array_kernel(int * input, int length){
     for(int i = 0; i < length; i++){
         printf("Array[%d] = %d \n", i, input[i]);
+    }
+}
+
+//kernel che stampa una matrice
+__global__ void printMatrix(int * matrix, int * a, int rows, int columns){
+    for (int i = 0; i < rows; i++){
+        for(int j = 0; j < columns; j++){
+            printf("matrice[l = %d, s = %d] = %d -> valore = %d\n", i, j, matrix[columns * i + j], a[matrix[columns * i + j]]);
+        }
     }
 }
 
@@ -411,22 +422,49 @@ __global__ void bitonic_warp_merge(int * keyin, int * output, int offset){
 //STEP 3:
 __global__ void loadSplitterMatrix(int * gpu_indexMatrix, int * splitters, int * d_a, int N, int l, int s){
 
-  int n = N / l;
+  int rowLength = N / l;
   int row = blockIdx.x;
   int splitterIndex = threadIdx.x;
 
-  __shared__ int sharedRow[n];
+  extern __shared__ int sharedRow[];
 
-  int len = n / s;
+  int len = rowLength / s;
 
+  if (blockIdx.x == 0 && threadIdx.x == 0)
+    printf("len = rowLength / s = %d, rowlength = %d\n", len, rowLength);
+
+  if (blockIdx.x == 1 && threadIdx.x == 0)
+    printf("len = rowLength / s = %d, rowlength = %d, splitterIndex = %d, row = %d, s = %d\n", len, rowLength, splitterIndex, row, s);
+
+  /*printf("sono il thread %d, %d e copio da d_a[%d * %d + %d * %d] a sharedRow[%d * %d]\n", row, splitterIndex, 
+         rowLength, row, splitterIndex, len, splitterIndex, len);*/
   //caricamento della row nella memoria shared
-  //TODO vedere se la roba sotto funziona
   for (int i = 0; i < len; i++){
-      sharedRow[splitterIndex * len + i] = d_a[n * row + splitterIndex * len + i];
+      sharedRow[splitterIndex * len + i] = d_a[rowLength * row + splitterIndex * len + i];
   }
 
-  //ricerca dell'indice corrispondente allo splitter
-  //TODO
+  /*
+  if (blockIdx.x == 0 && threadIdx.x == 0){
+      for (int i = 0; i < rowLength; i++){
+          printf("sharedRow[%d] = %d\n", i, sharedRow[i]);
+      }
+  }*/
+
+  
+  if(splitterIndex == 0){
+      
+    //caricamento dell'indice corrispondente allo splitter sulla matrice di output (caso primo indice della riga)
+    gpu_indexMatrix[s * row] = rowLength * row;
+
+  } else if (splitterIndex < s && splitterIndex > 0) {
+      
+    //ricerca dell'indice corrispondente allo splitter
+    int i;
+    for (i = 0; (splitters[splitterIndex] > sharedRow[i]) && i < len ; i++) {;}
+    
+    //caricamento dell'indice corrispondente allo splitter sulla matrice di output
+    gpu_indexMatrix[s * row + splitterIndex] = rowLength * row + i;
+  }
   
 }
 
@@ -714,7 +752,7 @@ int main(void) {
   }*/
   
   //versione GPU 
-  //TODO SISTEMARE
+  //TODO SISTEMARE, usare stream forse???
   //allocazione della matrice degli indici
   int* gpu_indexMatrix;
   CHECK(cudaMalloc((void**) &gpu_indexMatrix, s * l * sizeof(int)));
@@ -726,16 +764,13 @@ int main(void) {
   CHECK(cudaMemcpy(d_a, a, nBytes, cudaMemcpyHostToDevice));
 
   printf("prima di loadSplitterMatrix\n");
-  loadSplitterMatrix<<<1, l>>>(gpu_indexMatrix, splitters, d_a, N, l, s);
+  int rowLength = N / l; 
+  loadSplitterMatrix<<<l, s, rowLength * sizeof(int)>>>(gpu_indexMatrix, splitters, d_a, N, l, s);
   printf("dopo loadSplitterMatrix\n");
 
-  for (int i = 0; i < l; i++){}
-    print_array_kernel<<<1, 1>>>(gpu_indexMatrix[i], s);
-    CHECK(cudaMemcpy(s_indexes[i], gpu_indexMatrix[i], s, cudaMemcpyDeviceToHost));
-  }
-  
+  printMatrix<<<1, 1>>>(gpu_indexMatrix, d_a, l, s);
 
-
+  //registrazione del tempo step 3
   cudaEventRecord(stop_step);
 	cudaEventSynchronize(stop_step);
   cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
@@ -762,6 +797,9 @@ int main(void) {
           }
       }
   }*/
+
+  //TODO rimuovere
+  return 0;
 
   /****STEP 4: *************************************************************************************************/
   
