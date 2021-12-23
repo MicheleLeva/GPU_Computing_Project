@@ -6,11 +6,11 @@
 #include "../utils/common.h"
 
 #define THREADS 32
-#define BLOCKS 64
+#define BLOCKS 512
 #define T 64
 #define K 8
 
-int * get_splitters (int * input, int N, int s); //preliminary
+int * get_splitters (int * input, int s); //preliminary
 
 __global__ void bitonic_sort_warp(int *keyin); //step1
 
@@ -20,9 +20,13 @@ __global__ void print_array_kernel(int * input, int length);
 
 __global__ void printMatrix(int * matrix, int * a, int rows, int columns);
 
+__global__ void checkIndexMatrix(int * matrix, int * a, int l, int s, int * splitters, int N);
+
+__global__ void loadSegmentLengths(int * gpu_colIndexes, int * gpu_s_lengths, int * columnLength, int l, int s, int N, int * gpu_indexMatrix, int columnIndex);
+
 __global__ void load_placeholders(int * s_lengths, int * d_buffer, int * a, int * s_indexesByColumn);
 
-__global__ void loadOutput(int * d_buffer, int * d_b, int l, int columnLength, int global_index);
+__global__ void loadOutput(int * d_buffer, int * d_b, int l, int * columnLength, int global_index);
 
 __global__ void loadSplitterMatrix(int * gpu_indexMatrix, int * splitters, int * d_a, int N, int l, int s);
 
@@ -61,13 +65,31 @@ __global__ void print_array_kernel(int * input, int length){
 __global__ void printMatrix(int * matrix, int * a, int rows, int columns){
     for (int i = 0; i < rows; i++){
         for(int j = 0; j < columns; j++){
-            printf("matrice[l = %d, s = %d] = %d -> valore = %d\n", i, j, matrix[columns * i + j], a[matrix[columns * i + j]]);
+          printf("matrice[l = %d, s = %d] = %d -> valore = %d\n", i, j, matrix[columns * i + j], a[matrix[columns * i + j]]);
         }
     }
 }
 
+//kernel che controlla che la matrice degli indici sia stata creata correttamente
+__global__ void checkIndexMatrix(int * matrix, int * a, int l, int s, int * splitters, int N){
+    for (int i = 0; i < l; i++){
+      for (int j = 0; j < s; j++){
+          //printf("indice %d, %d di l, s = %d -> valore = %d\n", i, j, s_indexes[i][j], a[s_indexes[i][j]]);
+          if (j - 1 >= 0) {
+              if (a[matrix[i*s + j]] < splitters[j] ) printf("Errore: primo valore del segmento (%d, %d) = %d è minore dello splitter %d!\n", i, j, 
+                                                                         a[matrix[i*s + j]], splitters[j]);
+          }
+          
+          if (j + 1 < s){
+            if (a[matrix[i*s + j + 1] - 1] >= splitters[j + 1]) printf("Errore: ultimo valore del segmento (%d, %d) = %d è maggiore o uguale allo splitter %d\n", i, j, 
+                                                                         a[matrix[i*s + j + 1] - 1], splitters[j + 1]); 
+          }
+      }
+  }
+}
+
 //Preliminary splitter preparation function
-int * get_splitters (int * input, int N, int s){
+int * get_splitters (int * input, int s){
   int numElements = s * K;
 
   //printf("numElements = %d\n", numElements);
@@ -107,7 +129,6 @@ int * get_splitters (int * input, int N, int s){
     //ad ogni warp merge si inverte input ed output
     blocks.x = (numElements / 128) / 2;   // Number of blocks
     for(int offset = THREADS * 8; numElements / offset >= 1; offset *= 2){
-      //printf("N = %d, offset = %d, blocks.x = %d, threads.x = %d\n", N, offset, blocks, threads);
       if(isAfirst)
         bitonic_warp_merge<<<blocks, threads>>>(bufferA, bufferB, offset);
       else
@@ -430,14 +451,16 @@ __global__ void loadSplitterMatrix(int * gpu_indexMatrix, int * splitters, int *
 
   int len = rowLength / s;
 
+  /*
   if (blockIdx.x == 0 && threadIdx.x == 0)
     printf("len = rowLength / s = %d, rowlength = %d\n", len, rowLength);
 
   if (blockIdx.x == 1 && threadIdx.x == 0)
     printf("len = rowLength / s = %d, rowlength = %d, splitterIndex = %d, row = %d, s = %d\n", len, rowLength, splitterIndex, row, s);
 
-  /*printf("sono il thread %d, %d e copio da d_a[%d * %d + %d * %d] a sharedRow[%d * %d]\n", row, splitterIndex, 
+  printf("sono il thread %d, %d e copio da d_a[%d * %d + %d * %d] a sharedRow[%d * %d]\n", row, splitterIndex, 
          rowLength, row, splitterIndex, len, splitterIndex, len);*/
+         
   //caricamento della row nella memoria shared
   for (int i = 0; i < len; i++){
       sharedRow[splitterIndex * len + i] = d_a[rowLength * row + splitterIndex * len + i];
@@ -459,15 +482,50 @@ __global__ void loadSplitterMatrix(int * gpu_indexMatrix, int * splitters, int *
   } else if (splitterIndex < s && splitterIndex > 0) {
       
     //ricerca dell'indice corrispondente allo splitter
-    int i;
-    for (i = 0; (splitters[splitterIndex] > sharedRow[i]) && i < len ; i++) {;}
-    
+    int i = 0;
+    while (splitters[splitterIndex] > sharedRow[i] && i < rowLength){
+        i++;
+    }
+
     //caricamento dell'indice corrispondente allo splitter sulla matrice di output
     gpu_indexMatrix[s * row + splitterIndex] = rowLength * row + i;
   }
   
 }
 
+//Used in step 4 to find the segment lengths
+__global__ void loadSegmentLengths(int * gpu_colIndexes, int * gpu_s_lengths, int * columnLength, int l, int s, int N, int * gpu_indexMatrix, int columnIndex){
+  
+  int rowIndex = threadIdx.x;
+  
+  if (columnIndex + 1 >= s){ //se siamo nell'ultimo segmento della riga
+    if (rowIndex + 1 >= l){ // se siamo nell'ultimo segmento della colonna
+      gpu_s_lengths[rowIndex] = N - gpu_indexMatrix[rowIndex * s + columnIndex]; //caso limite ultimo segmento della matrice
+      if(gpu_s_lengths[rowIndex] > 128)
+        printf("N - gpu_indexMatrix[rowIndex * s + columnIndex] : %d - %d = %d", N, gpu_indexMatrix[rowIndex * s + columnIndex], gpu_s_lengths[rowIndex]);
+    } 
+    else{
+      gpu_s_lengths[rowIndex] = gpu_indexMatrix[(rowIndex + 1) * s + 0] - gpu_indexMatrix[rowIndex * s + columnIndex]; //ultimo segmento della riga
+      if(gpu_s_lengths[rowIndex] > 128)
+        printf("gpu_indexMatrix[(rowIndex + 1) * s + 0] - gpu_indexMatrix[rowIndex * s + columnIndex] : %d - %d = %d", 
+               gpu_indexMatrix[(rowIndex + 1) * s + 0], gpu_indexMatrix[rowIndex * s + columnIndex], gpu_s_lengths[rowIndex]);
+    }
+  } else{
+    gpu_s_lengths[rowIndex] = gpu_indexMatrix[rowIndex * s + columnIndex + 1] - gpu_indexMatrix[rowIndex * s + columnIndex]; 
+    //calcoliamo la lunghezza del segmento s
+    if(gpu_s_lengths[rowIndex] > 128)
+      printf("gpu_indexMatrix[rowIndex * s + columnIndex + 1] - gpu_indexMatrix[rowIndex * s + columnIndex] : %d - %d = %d", 
+            gpu_indexMatrix[rowIndex * s + columnIndex + 1], gpu_indexMatrix[rowIndex * s + columnIndex], gpu_s_lengths[rowIndex]);
+  }
+
+  gpu_colIndexes[rowIndex] = gpu_indexMatrix[rowIndex * s + columnIndex];
+
+  //printf("segmento %d, %d: s_length = %d\n", rowIndex, columnIndex, gpu_s_lengths[rowIndex]);
+  if(gpu_s_lengths[rowIndex] > 128){
+      printf("\n Segmento %d, %d: ERRORE SEGMENTO > 128\n\n", rowIndex, columnIndex);
+      return;
+  }
+}
 
 //Used in step 4 to load -1
 __global__ void load_placeholders(int * s_lengths, int * d_buffer, int * a, int * s_indexesByColumn){
@@ -623,9 +681,9 @@ int main(void) {
           break;
       }
   }
-  int s = BLOCKS / 2;
+  int s = BLOCKS / 2; //numero arbitrario ma funziona bene
 
-  printf ("\nStreaming multiprocessors = %d\n", l);
+  printf ("\nStreaming multiprocessors (l) = %d, s = %d\n", l, s);
 	
   cudaEvent_t start_step, stop_step;
 	cudaEventCreate(&start_step);
@@ -641,7 +699,7 @@ int main(void) {
   printf("\n*****PRELIMINARY STEP*****\n");
   cudaEventRecord(start_step);
 
-  int *output = get_splitters (a, N, s);
+  int *output = get_splitters (a, s);
 
   cudaEventRecord(stop_step);
 	cudaEventSynchronize(stop_step);
@@ -761,6 +819,8 @@ int main(void) {
   CHECK(cudaMalloc((void**) &splitters, s * sizeof(int)));
   CHECK(cudaMemcpy(splitters, output, sizeof(int) * s, cudaMemcpyHostToDevice));
 
+  cudaFree(d_a);
+  CHECK(cudaMalloc((void**) &d_a, nBytes));
   CHECK(cudaMemcpy(d_a, a, nBytes, cudaMemcpyHostToDevice));
 
   printf("prima di loadSplitterMatrix\n");
@@ -768,7 +828,8 @@ int main(void) {
   loadSplitterMatrix<<<l, s, rowLength * sizeof(int)>>>(gpu_indexMatrix, splitters, d_a, N, l, s);
   printf("dopo loadSplitterMatrix\n");
 
-  printMatrix<<<1, 1>>>(gpu_indexMatrix, d_a, l, s);
+  //printMatrix<<<1, 1>>>(gpu_indexMatrix, d_a, l, s);
+  //checkIndexMatrix<<<1, 1>>>(gpu_indexMatrix, d_a, l, s, splitters, N);
 
   //registrazione del tempo step 3
   cudaEventRecord(stop_step);
@@ -799,7 +860,7 @@ int main(void) {
   }*/
 
   //TODO rimuovere
-  return 0;
+  //return(0);
 
   /****STEP 4: *************************************************************************************************/
   
@@ -811,7 +872,6 @@ int main(void) {
 
   int *a_output;
   a_output = (int*) malloc(nBytes);
-  CHECK(cudaMemcpy(d_a, a, nBytes, cudaMemcpyHostToDevice));
   CHECK(cudaMemcpy(d_b, a, nBytes, cudaMemcpyHostToDevice));
 
   printf("\n*****STEP4*****\n");
@@ -820,14 +880,25 @@ int main(void) {
   for (int i = 0; i < s; i++){ //per ogni colonna
     int *cpu_buffer; //buffer on cpu used to build the first s segment with -1 placeholders
     cpu_buffer = (int*) malloc(l * 128 * sizeof(int));
-    int columnLength = 0;
+    int * columnLength = (int*) malloc(sizeof(int));
+    columnLength[0] = 0;
 
     int *d_buffer, *d_buffer_temp;
     CHECK(cudaMalloc((void**) &d_buffer, l * 128 * sizeof(int)));
     CHECK(cudaMalloc((void**) &d_buffer_temp, l * 128 * sizeof(int)));
 
-    //TODO portare sulla GPU per sfruttare la matrice degl indici GPU
+    int * gpu_colIndexes, *gpu_s_lengths;
+    CHECK(cudaMalloc((void**) &gpu_colIndexes, sizeof(int) * l));
+    CHECK(cudaMalloc((void**) &gpu_s_lengths, sizeof(int) * l));
+
     //copia delle lunghezze dei segmenti s in un buffer s_lengths e controllo che non sforino i 128 elementi
+    loadSegmentLengths<<<1, l>>>(gpu_colIndexes, gpu_s_lengths, columnLength, l, s, N, gpu_indexMatrix, i);
+ 
+    CHECK(cudaMemcpy(s_lengths, gpu_s_lengths, sizeof(int) * l, cudaMemcpyDeviceToHost));
+    for (int j = 0; j < l; j++) columnLength[0] += s_lengths[j];
+    //global_s_lengths += columnLength[0];
+
+    /*
     for (int j = 0; j < l; j++){
       if (i + 1 >= s){
         if (j + 1 >= l)
@@ -848,13 +919,7 @@ int main(void) {
 
       columnLength += s_lengths[j];
       //global_s_lengths += s_lengths[j];
-    }
-
-    int * gpu_colIndexes, *gpu_s_lengths;
-    CHECK(cudaMalloc((void**) &gpu_colIndexes, sizeof(int) * l));
-    CHECK(cudaMalloc((void**) &gpu_s_lengths, sizeof(int) * l));
-    CHECK(cudaMemcpy(gpu_colIndexes, s_indexesByColumn, sizeof(int) * l, cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(gpu_s_lengths, s_lengths, sizeof(int) * l, cudaMemcpyHostToDevice));
+    }*/
     
     //caricamento dei segmenti sul buffer d_buffer assieme ai placeholder -1
     load_placeholders<<<l, 128>>>(gpu_s_lengths, d_buffer, d_a, gpu_colIndexes);
@@ -877,11 +942,11 @@ int main(void) {
     
     //copia della colonna riordinata su output d_b
     if(!isAfirst){
-      loadOutput<<<l, 128>>>(d_buffer_temp, d_b, l, columnLength, global_index);
+      loadOutput<<<l, 128>>>(d_buffer_temp, d_b, l, columnLength[0], global_index);
     } else {
-      loadOutput<<<l, 128>>>(d_buffer, d_b, l, columnLength, global_index);
+      loadOutput<<<l, 128>>>(d_buffer, d_b, l, columnLength[0], global_index);
     }
-    global_index += columnLength;
+    global_index += columnLength[0];
    
     //printf("global_index nel for, colonna %d = %d\n", i, global_index);
     //printf("num_veri nel for, colonna %d = %d\n", i, num_veri);
