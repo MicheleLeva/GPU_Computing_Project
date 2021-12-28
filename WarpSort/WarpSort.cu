@@ -6,29 +6,39 @@
 #include "../utils/common.h"
 
 #define THREADS 32
-#define BLOCKS 512
+#define BLOCKS 2048
 #define T 64
 #define K 8
 
-int * get_splitters (int * input, int s); //preliminary
+//preliminary step for step 3
+int * get_splitters (int * input, int s); 
 
-__global__ void bitonic_sort_warp(int *keyin); //step1
+//step1
+__global__ void bitonic_sort_warp(int *keyin); 
 
-__global__ void bitonic_warp_merge(int * keyin, int * output, int offset); //step2
+//step2
+__global__ void bitonic_warp_merge(int * keyin, int * output, int offset); 
 
-__global__ void print_array_kernel(int * input, int length);
 
-__global__ void printMatrix(int * matrix, int * a, int rows, int columns);
+//step3
+__global__ void loadSplitterMatrix(int * gpu_indexMatrix, int * splitters, int * d_a, int N, int l, int s, int numBlocksPerRow);
 
 __global__ void checkIndexMatrix(int * matrix, int * a, int l, int s, int * splitters, int N);
 
+void cpuCheckIndexMatrix(int * s_indexes, int * a, int l, int s, int* output, int N);
+
+//step 4
 __global__ void loadSegmentLengths(int * gpu_colIndexes, int * gpu_s_lengths, int * columnLength, int l, int s, int N, int * gpu_indexMatrix, int columnIndex);
 
 __global__ void load_placeholders(int * s_lengths, int * d_buffer, int * a, int * s_indexesByColumn);
 
 __global__ void loadOutput(int * d_buffer, int * d_b, int l, int * columnLength, int global_index);
 
-__global__ void loadSplitterMatrix(int * gpu_indexMatrix, int * splitters, int * d_a, int N, int l, int s);
+
+//utilities
+__global__ void print_array_kernel(int * input, int length);
+
+__global__ void printMatrix(int * matrix, int * a, int rows, int columns);
 
 int get_length (int * array);
 
@@ -72,21 +82,58 @@ __global__ void printMatrix(int * matrix, int * a, int rows, int columns){
 
 //kernel che controlla che la matrice degli indici sia stata creata correttamente
 __global__ void checkIndexMatrix(int * matrix, int * a, int l, int s, int * splitters, int N){
-    for (int i = 0; i < l; i++){
-      for (int j = 0; j < s; j++){
+    int rowLength = N / l;
+
+    for (int i = 0; i < l; i++){ //riga
+      for (int j = 0; j < s; j++){ //colonna
           //printf("indice %d, %d di l, s = %d -> valore = %d\n", i, j, s_indexes[i][j], a[s_indexes[i][j]]);
-          if (j - 1 >= 0) {
-              if (a[matrix[i*s + j]] < splitters[j] ) printf("Errore: primo valore del segmento (%d, %d) = %d è minore dello splitter %d!\n", i, j, 
+          if (j == 0) {
+              if (matrix[i*s + j] != i*rowLength )
+                printf("Errore: indice del segmento (%d, %d) non è il primo della riga %d! valore -> %d\n", i, j, i, matrix[i*s + j]);
+          }
+          
+          if (j >= 1) {
+              if (a[matrix[i*s + j]] < splitters[j] ) 
+                printf("Errore: primo valore del segmento (%d, %d) = %d è minore dello splitter %d!\n", i, j, 
                                                                          a[matrix[i*s + j]], splitters[j]);
           }
           
-          if (j + 1 < s){
-            if (a[matrix[i*s + j + 1] - 1] >= splitters[j + 1]) printf("Errore: ultimo valore del segmento (%d, %d) = %d è maggiore o uguale allo splitter %d\n", i, j, 
+          if (j < s - 1){ //controlliamo che tutti i segmenti tranne nell'ultima colonna finiscano prima del prossimo splitter
+            if (a[matrix[i*s + j + 1] - 1] >= splitters[j + 1]) 
+              printf("Errore: ultimo valore del segmento (%d, %d) = %d è maggiore o uguale allo splitter %d\n", i, j, 
                                                                          a[matrix[i*s + j + 1] - 1], splitters[j + 1]); 
+          }
+
+          if (matrix[i*s + j] < 0 || matrix[i*s +j] > N)
+            printf("Errore: il primo indice del segmento (%d, %d) sfora i limiti! valore = %d\n", i, j, matrix[i*s +j]);
+      }
+  }
+}
+
+void cpuCheckIndexMatrix(int * s_indexes, int * a, int l, int s, int* output, int N){
+    for (int i = 0; i < l; i++){
+      for (int j = 0; j < s; j++){
+          //printf("indice %d, %d di l, s = %d -> valore = %d\n", i, j, s_indexes[i * s + j], a[s_indexes[i * s + j]]);
+          if (j - 1 >= 0) {
+              if (a[s_indexes[i * s + j]] < output[j] ) printf("Errore: primo valore del segmento %d, %d %d è minore dello splitter %d\n", i, j, 
+                                                                         a[s_indexes[i * s + j]], output[j]);
+          } else {
+              if (a[N / l * i] < 0) printf("Errore: primo valore del segmento %d, %d %d è minore di zero!\n", i, j, 
+                                                                         a[N / l * i]);
+          }
+          
+          if (j + 1 < s){
+            if (a[s_indexes[(i * s + j) + 1] - 1] >= output[j + 1]) 
+              printf("Errore: ultimo valore del segmento %d, %d %d è maggiore o uguale allo splitter %d\n", i, j, 
+                                                                         a[s_indexes[(i * s + j) + 1] - 1], output[j + 1]); 
+          } else {
+            if (a[N / l * i - 1] >= N) printf("Errore: ultimo valore del segmento %d, %d %d è maggiore o uguale allo splitter %d e ha sforato N!\n", i, j, 
+                                                                         a[N / l * i - 1], N);
           }
       }
   }
 }
+
 
 //Preliminary splitter preparation function
 int * get_splitters (int * input, int s){
@@ -441,55 +488,28 @@ __global__ void bitonic_warp_merge(int * keyin, int * output, int offset){
 }
 
 //STEP 3:
-__global__ void loadSplitterMatrix(int * gpu_indexMatrix, int * splitters, int * d_a, int N, int l, int s){
+__global__ void loadSplitterMatrix(int * gpu_indexMatrix, int * splitters, int * d_a, int N, int l, int s, int numBlocksPerRow){
 
   int rowLength = N / l;
-  int row = blockIdx.x;
-  int splitterIndex = threadIdx.x;
+  int row = floor(blockIdx.x / numBlocksPerRow);
 
-  extern __shared__ int sharedRow[];
+  int splitterIndex = (blockIdx.x - numBlocksPerRow * row) * blockDim.x + threadIdx.x;
 
-  int len = rowLength / s;
+  if (row == 8 && splitterIndex == 0)
+    printf("Segmento (%d, %d) = thread %d, blocco = %d\n", row, splitterIndex, threadIdx.x, blockIdx.x);
 
-  /*
-  if (blockIdx.x == 0 && threadIdx.x == 0)
-    printf("len = rowLength / s = %d, rowlength = %d\n", len, rowLength);
-
-  if (blockIdx.x == 1 && threadIdx.x == 0)
-    printf("len = rowLength / s = %d, rowlength = %d, splitterIndex = %d, row = %d, s = %d\n", len, rowLength, splitterIndex, row, s);
-
-  printf("sono il thread %d, %d e copio da d_a[%d * %d + %d * %d] a sharedRow[%d * %d]\n", row, splitterIndex, 
-         rowLength, row, splitterIndex, len, splitterIndex, len);*/
-         
-  //caricamento della row nella memoria shared
-  for (int i = 0; i < len; i++){
-      sharedRow[splitterIndex * len + i] = d_a[rowLength * row + splitterIndex * len + i];
-  }
-
-  /*
-  if (blockIdx.x == 0 && threadIdx.x == 0){
-      for (int i = 0; i < rowLength; i++){
-          printf("sharedRow[%d] = %d\n", i, sharedRow[i]);
-      }
-  }*/
-
-  
-  if(splitterIndex == 0){
-      
-    //caricamento dell'indice corrispondente allo splitter sulla matrice di output (caso primo indice della riga)
-    gpu_indexMatrix[s * row] = rowLength * row;
-
-  } else if (splitterIndex < s && splitterIndex > 0) {
-      
+  int i = 0;
+  if (splitterIndex > 0 && splitterIndex < s) {
+    
     //ricerca dell'indice corrispondente allo splitter
-    int i = 0;
-    while (splitters[splitterIndex] > sharedRow[i] && i < rowLength){
+    
+    while (splitters[splitterIndex] > d_a[rowLength * row + i] && i < rowLength){
         i++;
     }
-
-    //caricamento dell'indice corrispondente allo splitter sulla matrice di output
-    gpu_indexMatrix[s * row + splitterIndex] = rowLength * row + i;
   }
+
+  //caricamento dell'indice corrispondente allo splitter sulla matrice di output
+  gpu_indexMatrix[s * row + splitterIndex] = rowLength * row + i;
   
 }
 
@@ -502,20 +522,23 @@ __global__ void loadSegmentLengths(int * gpu_colIndexes, int * gpu_s_lengths, in
     if (rowIndex + 1 >= l){ // se siamo nell'ultimo segmento della colonna
       gpu_s_lengths[rowIndex] = N - gpu_indexMatrix[rowIndex * s + columnIndex]; //caso limite ultimo segmento della matrice
       if(gpu_s_lengths[rowIndex] > 128)
-        printf("N - gpu_indexMatrix[rowIndex * s + columnIndex] : %d - %d = %d", N, gpu_indexMatrix[rowIndex * s + columnIndex], gpu_s_lengths[rowIndex]);
+        printf("N - gpu_indexMatrix[rowIndex * s + columnIndex] : %d - %d = %d\n", 
+               N, gpu_indexMatrix[rowIndex * s + columnIndex], gpu_s_lengths[rowIndex]);
     } 
     else{
-      gpu_s_lengths[rowIndex] = gpu_indexMatrix[(rowIndex + 1) * s + 0] - gpu_indexMatrix[rowIndex * s + columnIndex]; //ultimo segmento della riga
+      //ultimo segmento della riga
+      gpu_s_lengths[rowIndex] = gpu_indexMatrix[(rowIndex + 1) * s + 0] - gpu_indexMatrix[rowIndex * s + columnIndex]; 
       if(gpu_s_lengths[rowIndex] > 128)
-        printf("gpu_indexMatrix[(rowIndex + 1) * s + 0] - gpu_indexMatrix[rowIndex * s + columnIndex] : %d - %d = %d", 
+        printf("gpu_indexMatrix[(rowIndex + 1) * s + 0] - gpu_indexMatrix[rowIndex * s + columnIndex] : %d - %d = %d\n", 
                gpu_indexMatrix[(rowIndex + 1) * s + 0], gpu_indexMatrix[rowIndex * s + columnIndex], gpu_s_lengths[rowIndex]);
     }
   } else{
     gpu_s_lengths[rowIndex] = gpu_indexMatrix[rowIndex * s + columnIndex + 1] - gpu_indexMatrix[rowIndex * s + columnIndex]; 
     //calcoliamo la lunghezza del segmento s
     if(gpu_s_lengths[rowIndex] > 128)
-      printf("gpu_indexMatrix[rowIndex * s + columnIndex + 1] - gpu_indexMatrix[rowIndex * s + columnIndex] : %d - %d = %d", 
-            gpu_indexMatrix[rowIndex * s + columnIndex + 1], gpu_indexMatrix[rowIndex * s + columnIndex], gpu_s_lengths[rowIndex]);
+      printf("gpu_indexMatrix[rowIndex * s + columnIndex + 1] - gpu_indexMatrix[rowIndex * s + columnIndex] : %d - %d = %d\n", 
+            gpu_indexMatrix[rowIndex * s + columnIndex + 1], gpu_indexMatrix[rowIndex * s + columnIndex], 
+             gpu_s_lengths[rowIndex]);
   }
 
   gpu_colIndexes[rowIndex] = gpu_indexMatrix[rowIndex * s + columnIndex];
@@ -790,24 +813,8 @@ int main(void) {
 
   cudaEventRecord(start_step);
 
-  int s_indexes[l][s];
-
-  /*
-  int index;
-  for (int i = 0; i < l; i++){
-    for (int j = 0; j < s; j++){
-      if (j == 0){
-          s_indexes[i][j] = N / l * i;
-      }
-      else if (j < s){
-        index = N / l * i + 1;
-        while (a[index] < output[j]){
-            index++;
-        }
-        s_indexes[i][j] = index;
-      }
-    }
-  }*/
+  int * s_indexes = (int*) malloc(sizeof(int) * l * s );
+  
   
   //versione GPU 
   //TODO SISTEMARE, usare stream forse???
@@ -824,12 +831,25 @@ int main(void) {
   CHECK(cudaMemcpy(d_a, a, nBytes, cudaMemcpyHostToDevice));
 
   printf("prima di loadSplitterMatrix\n");
-  int rowLength = N / l; 
-  loadSplitterMatrix<<<l, s, rowLength * sizeof(int)>>>(gpu_indexMatrix, splitters, d_a, N, l, s);
+
+  int numBlocksPerRow, k;
+  if (s > 1024){
+      numBlocksPerRow = s / 1024;
+      k = 1024;
+  }
+  else  {
+      numBlocksPerRow = 1;
+      k = s;
+  }
+
+  printf("k = %d", k);
+  loadSplitterMatrix<<<l, k>>>(gpu_indexMatrix, splitters, d_a, N, l, s, numBlocksPerRow);
   printf("dopo loadSplitterMatrix\n");
 
   //printMatrix<<<1, 1>>>(gpu_indexMatrix, d_a, l, s);
-  //checkIndexMatrix<<<1, 1>>>(gpu_indexMatrix, d_a, l, s, splitters, N);
+  checkIndexMatrix<<<1, 1>>>(gpu_indexMatrix, d_a, l, s, splitters, N);
+  CHECK(cudaMemcpy(s_indexes, gpu_indexMatrix, sizeof(int) * s * l, cudaMemcpyDeviceToHost));
+  //cpuCheckIndexMatrix(s_indexes, d_a, l, s, splitters, N);
 
   //registrazione del tempo step 3
   cudaEventRecord(stop_step);
@@ -837,34 +857,14 @@ int main(void) {
   cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
   printf("Step 3 time: %.5f (sec)\n", milliseconds_step / 1000);
 
-  /*
-  for (int i = 0; i < l; i++){
-      for (int j = 0; j < s; j++){
-          //printf("indice %d, %d di l, s = %d -> valore = %d\n", i, j, s_indexes[i][j], a[s_indexes[i][j]]);
-          if (j - 1 >= 0) {
-              if (a[s_indexes[i][j]] < output[j] ) printf("Errore: primo valore del segmento %d, %d %d è minore dello splitter %d\n", i, j, 
-                                                                         a[s_indexes[i][j]], output[j]);
-          } else {
-              if (a[N / l * i] < 0) printf("Errore: primo valore del segmento %d, %d %d è minore di zero!\n", i, j, 
-                                                                         a[N / l * i]);
-          }
-          
-          if (j + 1 < s){
-            if (a[s_indexes[i][j + 1] - 1] >= output[j + 1]) printf("Errore: ultimo valore del segmento %d, %d %d è maggiore o uguale allo splitter %d\n", i, j, 
-                                                                         a[s_indexes[i][j] - 1], output[j + 1]); 
-          } else {
-            if (a[N / l * i - 1] >= N) printf("Errore: ultimo valore del segmento %d, %d %d è maggiore o uguale allo splitter %d e ha sforato N!\n", i, j, 
-                                                                         a[N / l * i - 1], N);
-          }
-      }
-  }*/
-
   //TODO rimuovere
   //return(0);
 
   /****STEP 4: *************************************************************************************************/
   
   cudaEventRecord(start_step);
+
+  printf("\n*****STEP4*****\n");
 
   int global_index = 0;
   int s_lengths[l], s_indexesByColumn[l];
@@ -874,7 +874,7 @@ int main(void) {
   a_output = (int*) malloc(nBytes);
   CHECK(cudaMemcpy(d_b, a, nBytes, cudaMemcpyHostToDevice));
 
-  printf("\n*****STEP4*****\n");
+  
 
   //TODO (forse) possibile parallelizzazione pure in questo caso? da lavoro su una colonna alla volta a tutta la matrice in una volta + rimozione padding?
   for (int i = 0; i < s; i++){ //per ogni colonna
@@ -897,29 +897,6 @@ int main(void) {
     CHECK(cudaMemcpy(s_lengths, gpu_s_lengths, sizeof(int) * l, cudaMemcpyDeviceToHost));
     for (int j = 0; j < l; j++) columnLength[0] += s_lengths[j];
     //global_s_lengths += columnLength[0];
-
-    /*
-    for (int j = 0; j < l; j++){
-      if (i + 1 >= s){
-        if (j + 1 >= l)
-          s_lengths[j] = N - s_indexes[j][i]; //caso limite ultimo segmento
-        else
-          s_lengths[j] = s_indexes[j + 1][0] - s_indexes[j][i]; //ultimo segmento della riga
-      } else{
-        s_lengths[j] = s_indexes[j][i + 1] - s_indexes[j][i]; //calcoliamo la lunghezza del segmento s
-      }
-
-      s_indexesByColumn[j] = s_indexes[j][i];
-
-      //printf("segmento %d, %d: s_length = %d\n", j, i, s_lengths[j]);
-      if(s_lengths[j] > 128){
-          printf("\n\n ERRORE SEGMENTO > 128\n\n");
-          break;
-      }
-
-      columnLength += s_lengths[j];
-      //global_s_lengths += s_lengths[j];
-    }*/
     
     //caricamento dei segmenti sul buffer d_buffer assieme ai placeholder -1
     load_placeholders<<<l, 128>>>(gpu_s_lengths, d_buffer, d_a, gpu_colIndexes);
