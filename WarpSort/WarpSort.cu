@@ -6,7 +6,7 @@
 #include "../utils/common.h"
 
 #define THREADS 32
-#define BLOCKS 2048
+#define BLOCKS 16384
 #define T 64
 #define K 8
 
@@ -85,27 +85,40 @@ __global__ void checkIndexMatrix(int * matrix, int * a, int l, int s, int * spli
     int rowLength = N / l;
 
     for (int i = 0; i < l; i++){ //riga
+      bool printed = false;
+      
       for (int j = 0; j < s; j++){ //colonna
+        if (!printed){
           //printf("indice %d, %d di l, s = %d -> valore = %d\n", i, j, s_indexes[i][j], a[s_indexes[i][j]]);
           if (j == 0) {
-              if (matrix[i*s + j] != i*rowLength )
-                printf("Errore: indice del segmento (%d, %d) non è il primo della riga %d! valore -> %d\n", i, j, i, matrix[i*s + j]);
+              if (matrix[i*s + j] != i*rowLength ){
+                  printf("Errore: indice del segmento (%d, %d) non è il primo della riga %d! valore -> %d\n", i, j, i, matrix[i*s + j]);
+                  printed = true;
+              }
+                
           }
           
           if (j >= 1) {
-              if (a[matrix[i*s + j]] < splitters[j] ) 
-                printf("Errore: primo valore del segmento (%d, %d) = %d è minore dello splitter %d!\n", i, j, 
+              if (a[matrix[i*s + j]] < splitters[j] ) {
+                  printf("Errore: primo valore del segmento (%d, %d) = %d è minore dello splitter %d!\n", i, j, 
                                                                          a[matrix[i*s + j]], splitters[j]);
+                printed = true;
+              } 
+                
           }
           
           if (j < s - 1){ //controlliamo che tutti i segmenti tranne nell'ultima colonna finiscano prima del prossimo splitter
-            if (a[matrix[i*s + j + 1] - 1] >= splitters[j + 1]) 
-              printf("Errore: ultimo valore del segmento (%d, %d) = %d è maggiore o uguale allo splitter %d\n", i, j, 
+            if (a[matrix[i*s + j + 1] - 1] >= splitters[j + 1]) {
+               printf("Errore: ultimo valore del segmento (%d, %d) = %d è maggiore o uguale allo splitter %d\n", i, j, 
                                                                          a[matrix[i*s + j + 1] - 1], splitters[j + 1]); 
+              printed = true;
+            } 
+              
           }
 
           if (matrix[i*s + j] < 0 || matrix[i*s +j] > N)
             printf("Errore: il primo indice del segmento (%d, %d) sfora i limiti! valore = %d\n", i, j, matrix[i*s +j]);
+        }
       }
   }
 }
@@ -495,8 +508,9 @@ __global__ void loadSplitterMatrix(int * gpu_indexMatrix, int * splitters, int *
 
   int splitterIndex = (blockIdx.x - numBlocksPerRow * row) * blockDim.x + threadIdx.x;
 
-  if (row == 8 && splitterIndex == 0)
+  /*if (threadIdx.x == 0)
     printf("Segmento (%d, %d) = thread %d, blocco = %d\n", row, splitterIndex, threadIdx.x, blockIdx.x);
+  */
 
   int i = 0;
   if (splitterIndex > 0 && splitterIndex < s) {
@@ -699,12 +713,12 @@ int main(void) {
 	cudaGetDeviceProperties(&deviceProp, 0);
   int l = deviceProp.multiProcessorCount; //numero di streaming multiprocessor della GPU
   for (int k = 2; k < 1000; k *= 2){ 
-      if (k > l){ //TODO controllare se moltiplicando per 4 come suggerisce il paper migliora le prestazioni
-          l = k;
+      if (k > l){ 
+          l = k * 4 * 2;
           break;
       }
   }
-  int s = BLOCKS / 2; //numero arbitrario ma funziona bene
+  int s = BLOCKS / 16; //numero arbitrario ma funziona bene
 
   printf ("\nStreaming multiprocessors (l) = %d, s = %d\n", l, s);
 	
@@ -817,7 +831,6 @@ int main(void) {
   
   
   //versione GPU 
-  //TODO SISTEMARE, usare stream forse???
   //allocazione della matrice degli indici
   int* gpu_indexMatrix;
   CHECK(cudaMalloc((void**) &gpu_indexMatrix, s * l * sizeof(int)));
@@ -830,24 +843,26 @@ int main(void) {
   CHECK(cudaMalloc((void**) &d_a, nBytes));
   CHECK(cudaMemcpy(d_a, a, nBytes, cudaMemcpyHostToDevice));
 
-  printf("prima di loadSplitterMatrix\n");
+  //printf("prima di loadSplitterMatrix\n");
 
-  int numBlocksPerRow, k;
+  int numBlocksPerRow, j, k;
   if (s > 1024){
       numBlocksPerRow = s / 1024;
       k = 1024;
+      j = l * numBlocksPerRow;
   }
   else  {
       numBlocksPerRow = 1;
       k = s;
+      j = l;
   }
 
-  printf("k = %d", k);
-  loadSplitterMatrix<<<l, k>>>(gpu_indexMatrix, splitters, d_a, N, l, s, numBlocksPerRow);
-  printf("dopo loadSplitterMatrix\n");
+  //printf("j = %d, k = %d, numBlocksPerRow = %d\n", j, k, numBlocksPerRow);
+  loadSplitterMatrix<<<j, k>>>(gpu_indexMatrix, splitters, d_a, N, l, s, numBlocksPerRow);
+  //printf("dopo loadSplitterMatrix\n");
 
   //printMatrix<<<1, 1>>>(gpu_indexMatrix, d_a, l, s);
-  checkIndexMatrix<<<1, 1>>>(gpu_indexMatrix, d_a, l, s, splitters, N);
+  //checkIndexMatrix<<<1, 1>>>(gpu_indexMatrix, d_a, l, s, splitters, N);
   CHECK(cudaMemcpy(s_indexes, gpu_indexMatrix, sizeof(int) * s * l, cudaMemcpyDeviceToHost));
   //cpuCheckIndexMatrix(s_indexes, d_a, l, s, splitters, N);
 
@@ -856,9 +871,6 @@ int main(void) {
 	cudaEventSynchronize(stop_step);
   cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
   printf("Step 3 time: %.5f (sec)\n", milliseconds_step / 1000);
-
-  //TODO rimuovere
-  //return(0);
 
   /****STEP 4: *************************************************************************************************/
   
@@ -874,9 +886,6 @@ int main(void) {
   a_output = (int*) malloc(nBytes);
   CHECK(cudaMemcpy(d_b, a, nBytes, cudaMemcpyHostToDevice));
 
-  
-
-  //TODO (forse) possibile parallelizzazione pure in questo caso? da lavoro su una colonna alla volta a tutta la matrice in una volta + rimozione padding?
   for (int i = 0; i < s; i++){ //per ogni colonna
     int *cpu_buffer; //buffer on cpu used to build the first s segment with -1 placeholders
     cpu_buffer = (int*) malloc(l * 128 * sizeof(int));
