@@ -6,10 +6,12 @@
 #include "../utils/common.h"
 
 #define THREADS 32
-#define BLOCKS 32768
+#define BLOCKS 1024*16*2
 #define T 64
 #define K 8
+#define C 100
 
+//1024  2048  32768
 //preliminary step for step 3
 int * get_splitters (int * input, int s); 
 
@@ -661,332 +663,352 @@ void bitonicSort(int a[], int low, int cnt, int dir) {
  ******************* MAIN *****************************************************************
  */
 int main(void) {
-	cudaEvent_t start, stop;
-	cudaEventCreate(&start);
-	cudaEventCreate(&stop);
-
-	int N = THREADS*4*BLOCKS;
-  printf ("N = %d\n",N);
-	// check
-	if (!(N && !(N & (N - 1)))) {
-		printf("ERROR: N must be power of 2 (N = %d)\n", N);
-		exit(1);
-	}
-	size_t nBytes = N * sizeof(int);
-	int *a = (int*) malloc(nBytes);
-	int *b = (int*) malloc(nBytes);
-
-  srand ( time(NULL) );
-	// fill data
-	for (int i = 0; i < N; ++i) {
-		//a[i] =  i%5; //rand() % 100; // / (float) RAND_MAX;
-    //a[i] = rand() % 1000;
-    a[i] = i;
-	}
   
-  shuffle(a, N);
+float total_time_GPU = 0;
+double total_time_CPU = 0;
 
-  for (int i = 0; i < N; i++){
-      b[i] = a [i];
-  }
+  for (int t = 0; t < C; t++){
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
-	// bitonic CPU
-	double cpu_time = seconds();
+    int N = THREADS*4*BLOCKS;
+    printf ("N = %d\n",N);
+    // check
+    if (!(N && !(N & (N - 1)))) {
+      printf("ERROR: N must be power of 2 (N = %d)\n", N);
+      exit(1);
+    }
+    size_t nBytes = N * sizeof(int);
+    int *a = (int*) malloc(nBytes);
+    int *b = (int*) malloc(nBytes);
 
-  bitonicSort(b, 0, N, 1);   // 1 means sort in ascending order
-
-	printf("CPU elapsed time: %.5f (sec)\n", seconds()-cpu_time);
-
-	// device mem copy
-	int *d_a, * d_b;
-	CHECK(cudaMalloc((void**) &d_a, nBytes));
-  CHECK(cudaMalloc((void**) &d_b, nBytes));
-	CHECK(cudaMemcpy(d_a, a, nBytes, cudaMemcpyHostToDevice));
-
-	// num of threads
-	dim3 blocks(BLOCKS, 1);   // Number of blocks
-  dim3 threads(THREADS, 1); // Number of threads
-	
-  cudaDeviceProp deviceProp;
-	cudaGetDeviceProperties(&deviceProp, 0);
-  int l = deviceProp.multiProcessorCount; //numero di streaming multiprocessor della GPU
-  for (int k = 2; k < 1000; k *= 2){ 
-      if (k > l){ 
-          l = k * 4 * 2;
-          break;
-      }
-  }
-  int s = BLOCKS / 16; //numero arbitrario ma funziona bene
-
-  printf ("\nStreaming multiprocessors (l) = %d, s = %d\n", l, s);
-	
-  cudaEvent_t start_step, stop_step;
-	cudaEventCreate(&start_step);
-  cudaEventCreate(&stop_step);
-  float milliseconds_step = 0;
-  
-
-  // start computation
-	cudaEventRecord(start);
-
-  /*PRELIMINARY SPLITTER STEP3*********************************************************************/
-  //si trovano gli splitter che poi verranno usati nello step 3
-  printf("\n*****PRELIMINARY STEP*****\n");
-  cudaEventRecord(start_step);
-
-  int *output = get_splitters (a, s);
-
-  cudaEventRecord(stop_step);
-	cudaEventSynchronize(stop_step);
-  cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
-  printf("Preliminary step time: %.5f (sec)\n", milliseconds_step / 1000);
-
-  /*
-  //Check se il sort del preliminary step è avvenuto correttamente
-  for (int i = 1; i < s; i++){
-      if (output[i] < output[i-1])
-        printf("Preliminary step: errore! -> output[%d] = %d < output[%d] = %d\n", i, i-1, output[i], output[i-1]);
-  }*/
-  
-  /*STEP 1: Divide the input sequence into equal-sized subsequences. *******************************************
-  Each subsequence will be sorted by an independent warp using the bitonic network.*/
-  printf("\n*****STEP1*****\n");
-
-  cudaEventRecord(start_step);
-
-  bitonic_sort_warp<<<blocks, threads>>>(d_a);
-
-  cudaEventRecord(stop_step);
-	cudaEventSynchronize(stop_step);
-  cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
-  printf("Step 1 time: %.5f (sec)\n", milliseconds_step / 1000);
-
-  /*//Check se il sort dello step 1 è avvenuto correttamente
-  int* temp = (int*) malloc(nBytes);
-  CHECK(cudaMemcpy(temp, d_a, nBytes, cudaMemcpyDeviceToHost));
-  for (int i = 1; i < N; i++){
-      if ((temp[i] < temp[i-1]) && (i % 128 != 0))
-        printf("Step 1: errore! -> temp[%d] = %d < temp[%d] = %d\n", i, i-1, temp[i], temp[i-1]);
-  }*/
-
-  
-  /*STEP 2: Merge all the subsequences produced in step 1 until the parallelism is insufficient.*******************/
-  bool isAfirst = true;
-  blocks.x = BLOCKS / 2;   // Number of blocks
-
-  printf("\n*****STEP2*****\n");
-
-  cudaEventRecord(start_step);
-
-  int maxOrderedSegmentSize;
-  //finchè il parallelismo è insufficiente, ovvero finchè N / offset >= l
-  //ad ogni warp merge si inverte input ed output raddoppiando la lunghezza del segmento che il warp deve ordinare
-  for(int offset = THREADS * 8; N / offset >= l; offset *= 2){
-    //printf("Step 2 - Offset = %d\n", offset); 
-    if(isAfirst)
-      bitonic_warp_merge<<<blocks, threads>>>(d_a, d_b, offset);
-    else
-      bitonic_warp_merge<<<blocks, threads>>>(d_b, d_a, offset);
-    blocks.x = blocks.x / 2;
+    srand ( time(NULL) );
+    // fill data
+    for (int i = 0; i < N; ++i) {
+      //a[i] =  i%5; //rand() % 100; // / (float) RAND_MAX;
+      //a[i] = rand() % 1000;
+      a[i] = i;
+    }
     
-    isAfirst = !isAfirst;
-    maxOrderedSegmentSize = offset;
-  }
-  
+    shuffle(a, N);
 
-  //recover data
-  if(!isAfirst){
-      CHECK(cudaMemcpy(a, d_b, nBytes, cudaMemcpyDeviceToHost));
-  } else {
-      CHECK(cudaMemcpy(a, d_a, nBytes, cudaMemcpyDeviceToHost));
-  }
+    for (int i = 0; i < N; i++){
+        b[i] = a [i];
+    }
 
-  cudaEventRecord(stop_step);
-	cudaEventSynchronize(stop_step);
-  cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
-  printf("Step 2 time: %.5f (sec)\n", milliseconds_step / 1000);
+    // bitonic CPU
+    double cpu_time = seconds();
 
-  /*
-  //Check se il sort dello step 2 è avvenuto correttamente
-  for (int i = 1; i < N; i++){
-      if ((a[i] < a[i-1]) && (i % maxOrderedSegmentSize != 0))
-        printf("Step 2: errore! -> a[%d] = %d < a[%d] = %d\n", i, i-1, a[i], a[i-1]);
-  }*/
-  
-  /*STEP 3: Split the large subsequences produced in step 2 into small ones that can be merged independently.*******************/
+    bitonicSort(b, 0, N, 1);   // 1 means sort in ascending order
 
-  printf("\n*****STEP3*****\n");
+    double computation_time = seconds() - cpu_time;
+    printf("CPU elapsed time: %.5f (sec)\n", computation_time);
+    total_time_CPU += computation_time;
 
-  cudaEventRecord(start_step);
-  
-  //allocazione della matrice degli indici su GPU
-  int* gpu_indexMatrix;
-  CHECK(cudaMalloc((void**) &gpu_indexMatrix, s * l * sizeof(int)));
+    // device mem copy
+    int *d_a, * d_b;
+    CHECK(cudaMalloc((void**) &d_a, nBytes));
+    CHECK(cudaMalloc((void**) &d_b, nBytes));
+    CHECK(cudaMemcpy(d_a, a, nBytes, cudaMemcpyHostToDevice));
 
-  //allocazione degli splitters su GPU
-  int* splitters;
-  CHECK(cudaMalloc((void**) &splitters, s * sizeof(int)));
-  CHECK(cudaMemcpy(splitters, output, sizeof(int) * s, cudaMemcpyHostToDevice));
-
-  //allocazione dell'array da riordinare su GPU
-  cudaFree(d_a);
-  CHECK(cudaMalloc((void**) &d_a, nBytes));
-  CHECK(cudaMemcpy(d_a, a, nBytes, cudaMemcpyHostToDevice));
-
-  //modulazione del numero di blocchi e thread per non sforare il numero massimo di thread per blocco
-  int numBlocksPerRow, j, k;
-  if (s > 1024){
-      numBlocksPerRow = s / 1024;
-      k = 1024;
-      j = l * numBlocksPerRow;
-  }
-  else  {
-      numBlocksPerRow = 1;
-      k = s;
-      j = l;
-  }
-
-  //printf("j = %d, k = %d, numBlocksPerRow = %d\n", j, k, numBlocksPerRow);
-
-  //calcolo degli indici dei segmeenti di ogni riga e caricamento sulla matrice
-  loadSplitterMatrix<<<j, k>>>(gpu_indexMatrix, splitters, d_a, N, l, s, numBlocksPerRow);
-
-  //printMatrix<<<1, 1>>>(gpu_indexMatrix, d_a, l, s);
-  //checkIndexMatrix<<<1, 1>>>(gpu_indexMatrix, d_a, l, s, splitters, N);
-
-  //registrazione del tempo step 3
-  cudaEventRecord(stop_step);
-	cudaEventSynchronize(stop_step);
-  cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
-  printf("Step 3 time: %.5f (sec)\n", milliseconds_step / 1000);
-
-  /****STEP 4: *************************************************************************************************/
-  
-  cudaEventRecord(start_step);
-
-  printf("\n*****STEP4*****\n");
-
-  int global_index = 0;
-  int s_lengths[l], s_indexesByColumn[l];
-  int global_s_lengths = 0;
-
-  //allocazione dell'array di output e caricamento dell'array da riordinare su GPU
-  int *a_output;
-  a_output = (int*) malloc(nBytes);
-  CHECK(cudaMemcpy(d_b, a, nBytes, cudaMemcpyHostToDevice));
-
-  //per ogni colonna vengono riordinate i segmenti e caricati sull'output
-  for (int i = 0; i < s; i++){ 
-    int *cpu_buffer; //buffer on cpu used to build the first s segment with -1 placeholders
-    cpu_buffer = (int*) malloc(l * 128 * sizeof(int));
-    int * columnLength = (int*) malloc(sizeof(int));
-    columnLength[0] = 0;
-
-    int *d_buffer, *d_buffer_temp;
-    CHECK(cudaMalloc((void**) &d_buffer, l * 128 * sizeof(int)));
-    CHECK(cudaMalloc((void**) &d_buffer_temp, l * 128 * sizeof(int)));
-
-    int * gpu_colIndexes, *gpu_s_lengths;
-    CHECK(cudaMalloc((void**) &gpu_colIndexes, sizeof(int) * l));
-    CHECK(cudaMalloc((void**) &gpu_s_lengths, sizeof(int) * l));
-
-    //copia delle lunghezze dei segmenti s in un buffer s_lengths e controllo che non sforino i 128 elementi
-    loadSegmentLengths<<<1, l>>>(gpu_colIndexes, gpu_s_lengths, columnLength, l, s, N, gpu_indexMatrix, i);
- 
-    CHECK(cudaMemcpy(s_lengths, gpu_s_lengths, sizeof(int) * l, cudaMemcpyDeviceToHost));
-    for (int j = 0; j < l; j++) columnLength[0] += s_lengths[j];
-    //global_s_lengths += columnLength[0];
+    // num of threads
+    dim3 blocks(BLOCKS, 1);   // Number of blocks
+    dim3 threads(THREADS, 1); // Number of threads
     
-    //caricamento dei segmenti sul buffer d_buffer assieme ai placeholder -1
-    load_placeholders<<<l, 128>>>(gpu_s_lengths, d_buffer, d_a, gpu_colIndexes);
-    
-    //CHECK(cudaMemcpy(d_buffer, cpu_buffer, l * 128 * sizeof(int), cudaMemcpyHostToDevice));
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, 0);
+    int l = deviceProp.multiProcessorCount; //numero di streaming multiprocessor della GPU
+    for (int k = 2; k < 1000; k *= 2){ 
+        if (k > l){ 
+            l = k * 4 * 2;
+            break;
+        }
+    }
+    int s = BLOCKS / 16; //numero arbitrario ma funziona bene
 
-    //riordino di d_buffer (colonna) attraverso bitonic_warp_merge come in step 2
-    blocks.x = l / 2;   // Number of blocks (warps)
-    isAfirst = true;
-    for(int offset = THREADS * 8; l * 128 / offset >= 1 ; offset *= 2){ 
-      //printf("Step 2 nello step4: offset = %d, blocks.x = %d\n", offset, blocks.x );
+    printf ("\nStreaming multiprocessors (l) = %d, s = %d\n", l, s);
+    
+    cudaEvent_t start_step, stop_step;
+    cudaEventCreate(&start_step);
+    cudaEventCreate(&stop_step);
+    float milliseconds_step = 0;
+    
+
+    // start computation
+    cudaEventRecord(start);
+
+    /*PRELIMINARY SPLITTER STEP3*********************************************************************/
+    //si trovano gli splitter che poi verranno usati nello step 3
+    printf("\n*****PRELIMINARY STEP*****\n");
+    cudaEventRecord(start_step);
+
+    int *output = get_splitters (a, s);
+
+    cudaEventRecord(stop_step);
+    cudaEventSynchronize(stop_step);
+    cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
+    printf("Preliminary step time: %.5f (sec)\n", milliseconds_step / 1000);
+
+    /*
+    //Check se il sort del preliminary step è avvenuto correttamente
+    for (int i = 1; i < s; i++){
+        if (output[i] < output[i-1])
+          printf("Preliminary step: errore! -> output[%d] = %d < output[%d] = %d\n", i, i-1, output[i], output[i-1]);
+    }*/
+    
+    /*STEP 1: Divide the input sequence into equal-sized subsequences. *******************************************
+    Each subsequence will be sorted by an independent warp using the bitonic network.*/
+    printf("\n*****STEP1*****\n");
+
+    cudaEventRecord(start_step);
+
+    bitonic_sort_warp<<<blocks, threads>>>(d_a);
+
+    cudaEventRecord(stop_step);
+    cudaEventSynchronize(stop_step);
+    cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
+    printf("Step 1 time: %.5f (sec)\n", milliseconds_step / 1000);
+
+    /*//Check se il sort dello step 1 è avvenuto correttamente
+    int* temp = (int*) malloc(nBytes);
+    CHECK(cudaMemcpy(temp, d_a, nBytes, cudaMemcpyDeviceToHost));
+    for (int i = 1; i < N; i++){
+        if ((temp[i] < temp[i-1]) && (i % 128 != 0))
+          printf("Step 1: errore! -> temp[%d] = %d < temp[%d] = %d\n", i, i-1, temp[i], temp[i-1]);
+    }*/
+
+    
+    /*STEP 2: Merge all the subsequences produced in step 1 until the parallelism is insufficient.*******************/
+    bool isAfirst = true;
+    blocks.x = BLOCKS / 2;   // Number of blocks
+
+    printf("\n*****STEP2*****\n");
+
+    cudaEventRecord(start_step);
+
+    int maxOrderedSegmentSize;
+    //finchè il parallelismo è insufficiente, ovvero finchè N / offset >= l
+    //ad ogni warp merge si inverte input ed output raddoppiando la lunghezza del segmento che il warp deve ordinare
+    for(int offset = THREADS * 8; N / offset >= l; offset *= 2){
+      //printf("Step 2 - Offset = %d\n", offset); 
       if(isAfirst)
-        bitonic_warp_merge<<<blocks, threads>>>(d_buffer, d_buffer_temp, offset);
+        bitonic_warp_merge<<<blocks, threads>>>(d_a, d_b, offset);
       else
-        bitonic_warp_merge<<<blocks, threads>>>(d_buffer_temp, d_buffer, offset);
+        bitonic_warp_merge<<<blocks, threads>>>(d_b, d_a, offset);
       blocks.x = blocks.x / 2;
       
       isAfirst = !isAfirst;
+      maxOrderedSegmentSize = offset;
     }
     
-    //copia della colonna riordinata su output d_b
+
+    //recover data
     if(!isAfirst){
-      loadOutput<<<l, 128>>>(d_buffer_temp, d_b, l, columnLength[0], global_index);
+        CHECK(cudaMemcpy(a, d_b, nBytes, cudaMemcpyDeviceToHost));
     } else {
-      loadOutput<<<l, 128>>>(d_buffer, d_b, l, columnLength[0], global_index);
+        CHECK(cudaMemcpy(a, d_a, nBytes, cudaMemcpyDeviceToHost));
     }
-    global_index += columnLength[0];
-   
-    //printf("global_index nel for, colonna %d = %d\n", i, global_index);
-    //printf("num_veri nel for, colonna %d = %d\n", i, num_veri);
-    //printf("global_s_lengths nel for, colonna %d = %d\n", i, global_s_lengths);
+
+    cudaEventRecord(stop_step);
+    cudaEventSynchronize(stop_step);
+    cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
+    printf("Step 2 time: %.5f (sec)\n", milliseconds_step / 1000);
+
+    /*
+    //Check se il sort dello step 2 è avvenuto correttamente
+    for (int i = 1; i < N; i++){
+        if ((a[i] < a[i-1]) && (i % maxOrderedSegmentSize != 0))
+          printf("Step 2: errore! -> a[%d] = %d < a[%d] = %d\n", i, i-1, a[i], a[i-1]);
+    }*/
     
-    cudaFree(d_buffer); 
-    cudaFree(d_buffer_temp); 
-    free(cpu_buffer);
+    /*STEP 3: Split the large subsequences produced in step 2 into small ones that can be merged independently.*******************/
+
+    printf("\n*****STEP3*****\n");
+
+    cudaEventRecord(start_step);
+    
+    //allocazione della matrice degli indici su GPU
+    int* gpu_indexMatrix;
+    CHECK(cudaMalloc((void**) &gpu_indexMatrix, s * l * sizeof(int)));
+
+    //allocazione degli splitters su GPU
+    int* splitters;
+    CHECK(cudaMalloc((void**) &splitters, s * sizeof(int)));
+    CHECK(cudaMemcpy(splitters, output, sizeof(int) * s, cudaMemcpyHostToDevice));
+
+    //allocazione dell'array da riordinare su GPU
+    cudaFree(d_a);
+    CHECK(cudaMalloc((void**) &d_a, nBytes));
+    CHECK(cudaMemcpy(d_a, a, nBytes, cudaMemcpyHostToDevice));
+
+    //modulazione del numero di blocchi e thread per non sforare il numero massimo di thread per blocco
+    int numBlocksPerRow, j, k;
+    if (s > 1024){
+        numBlocksPerRow = s / 1024;
+        k = 1024;
+        j = l * numBlocksPerRow;
+    }
+    else  {
+        numBlocksPerRow = 1;
+        k = s;
+        j = l;
+    }
+
+    //printf("j = %d, k = %d, numBlocksPerRow = %d\n", j, k, numBlocksPerRow);
+
+    //calcolo degli indici dei segmeenti di ogni riga e caricamento sulla matrice
+    loadSplitterMatrix<<<j, k>>>(gpu_indexMatrix, splitters, d_a, N, l, s, numBlocksPerRow);
+
+    //printMatrix<<<1, 1>>>(gpu_indexMatrix, d_a, l, s);
+    //checkIndexMatrix<<<1, 1>>>(gpu_indexMatrix, d_a, l, s, splitters, N);
+
+    //registrazione del tempo step 3
+    cudaEventRecord(stop_step);
+    cudaEventSynchronize(stop_step);
+    cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
+    printf("Step 3 time: %.5f (sec)\n", milliseconds_step / 1000);
+
+    /****STEP 4: *************************************************************************************************/
+    
+    cudaEventRecord(start_step);
+
+    printf("\n*****STEP4*****\n");
+
+    int global_index = 0;
+    int s_lengths[l], s_indexesByColumn[l];
+    int global_s_lengths = 0;
+
+    //allocazione dell'array di output e caricamento dell'array da riordinare su GPU
+    int *a_output;
+    a_output = (int*) malloc(nBytes);
+    CHECK(cudaMemcpy(d_b, a, nBytes, cudaMemcpyHostToDevice));
+
+    //per ogni colonna vengono riordinate i segmenti e caricati sull'output
+    for (int i = 0; i < s; i++){ 
+      int *cpu_buffer; //buffer on cpu used to build the first s segment with -1 placeholders
+      cpu_buffer = (int*) malloc(l * 128 * sizeof(int));
+      int * columnLength = (int*) malloc(sizeof(int));
+      columnLength[0] = 0;
+
+      int *d_buffer, *d_buffer_temp;
+      CHECK(cudaMalloc((void**) &d_buffer, l * 128 * sizeof(int)));
+      CHECK(cudaMalloc((void**) &d_buffer_temp, l * 128 * sizeof(int)));
+
+      int * gpu_colIndexes, *gpu_s_lengths;
+      CHECK(cudaMalloc((void**) &gpu_colIndexes, sizeof(int) * l));
+      CHECK(cudaMalloc((void**) &gpu_s_lengths, sizeof(int) * l));
+
+      //copia delle lunghezze dei segmenti s in un buffer s_lengths e controllo che non sforino i 128 elementi
+      loadSegmentLengths<<<1, l>>>(gpu_colIndexes, gpu_s_lengths, columnLength, l, s, N, gpu_indexMatrix, i);
+  
+      CHECK(cudaMemcpy(s_lengths, gpu_s_lengths, sizeof(int) * l, cudaMemcpyDeviceToHost));
+      for (int j = 0; j < l; j++) columnLength[0] += s_lengths[j];
+      //global_s_lengths += columnLength[0];
+      
+      //caricamento dei segmenti sul buffer d_buffer assieme ai placeholder -1
+      load_placeholders<<<l, 128>>>(gpu_s_lengths, d_buffer, d_a, gpu_colIndexes);
+      
+      //CHECK(cudaMemcpy(d_buffer, cpu_buffer, l * 128 * sizeof(int), cudaMemcpyHostToDevice));
+
+      //riordino di d_buffer (colonna) attraverso bitonic_warp_merge come in step 2
+      blocks.x = l / 2;   // Number of blocks (warps)
+      isAfirst = true;
+      for(int offset = THREADS * 8; l * 128 / offset >= 1 ; offset *= 2){ 
+        //printf("Step 2 nello step4: offset = %d, blocks.x = %d\n", offset, blocks.x );
+        if(isAfirst)
+          bitonic_warp_merge<<<blocks, threads>>>(d_buffer, d_buffer_temp, offset);
+        else
+          bitonic_warp_merge<<<blocks, threads>>>(d_buffer_temp, d_buffer, offset);
+        blocks.x = blocks.x / 2;
+        
+        isAfirst = !isAfirst;
+      }
+      
+      //copia della colonna riordinata su output d_b
+      if(!isAfirst){
+        loadOutput<<<l, 128>>>(d_buffer_temp, d_b, l, columnLength[0], global_index);
+      } else {
+        loadOutput<<<l, 128>>>(d_buffer, d_b, l, columnLength[0], global_index);
+      }
+      global_index += columnLength[0];
+    
+      //printf("global_index nel for, colonna %d = %d\n", i, global_index);
+      //printf("num_veri nel for, colonna %d = %d\n", i, num_veri);
+      //printf("global_s_lengths nel for, colonna %d = %d\n", i, global_s_lengths);
+      
+      cudaFree(d_buffer); 
+      cudaFree(d_buffer_temp); 
+      free(cpu_buffer);
+    }
+
+    //printf("\n\nglobal_index = %d\n", global_index);
+    //printf("global_s_lengths = %d\n", global_s_lengths);
+    
+    // recover data
+    cudaMemcpy(a_output, d_b, nBytes, cudaMemcpyDeviceToHost);
+
+    cudaEventRecord(stop_step);
+    cudaEventSynchronize(stop_step);
+    cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
+    printf("Step 4 time: %.5f (sec)\n", milliseconds_step / 1000);
+
+    //total elapsed time print
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("GPU elapsed time: %.5f (sec)\n", milliseconds / 1000);
+    total_time_GPU += milliseconds / 1000;
+
+    // print & check
+
+    bool errors = false;
+
+    if (N < 100) {
+      printf("GPU:\n");
+      for (int i = 0; i < N; ++i){
+        if(i % 128 == 0)
+          printf("sottosequenza, indice = %d\n", i);
+        printf("%d : %d\n", i, a[i]);
+      }
+        
+        /*
+      printf("CPU:\n");
+      for (int i = 0; i < N; ++i)
+        printf("%d\n", b[i]);
+        */
+    }
+    else {
+      
+      for (int i = 0; i < N; ++i) {
+        //printf("a[%d] = %d, b[%d] = %d)\n", i, a_output[i], i, b[i]);
+        if (a_output[i] != b[i]) {
+          printf("ERROR a[%d] != b[%d]  (a[i] = %d  -  b[i] = %d)\n", i,i, a_output[i],b[i]);
+          errors = true;
+          break;
+        }
+      }
+    }
+
+    if (!errors)
+      printf("SORTING AVVENUTO CON SUCCESSO!\n");
+
+    free(a);
+    free(a_output);
+    cudaFree(d_a);
+    cudaFree(d_b);
   }
 
-  //printf("\n\nglobal_index = %d\n", global_index);
-  //printf("global_s_lengths = %d\n", global_s_lengths);
-  
-	// recover data
-  cudaMemcpy(a_output, d_b, nBytes, cudaMemcpyDeviceToHost);
+  int N = THREADS*4*BLOCKS;
 
-  cudaEventRecord(stop_step);
-	cudaEventSynchronize(stop_step);
-  cudaEventElapsedTime(&milliseconds_step, start_step, stop_step);
-  printf("Step 4 time: %.5f (sec)\n", milliseconds_step / 1000);
-
-  //total elapsed time print
-  cudaEventRecord(stop);
-	cudaEventSynchronize(stop);
-	float milliseconds = 0;
-	cudaEventElapsedTime(&milliseconds, start, stop);
-	printf("GPU elapsed time: %.5f (sec)\n", milliseconds / 1000);
-
-	// print & check
-
-  bool errors = false;
-
-	if (N < 100) {
-		printf("GPU:\n");
-		for (int i = 0; i < N; ++i){
-      if(i % 128 == 0)
-        printf("sottosequenza, indice = %d\n", i);
-      printf("%d : %d\n", i, a[i]);
-    }
-			
-      /*
-		printf("CPU:\n");
-		for (int i = 0; i < N; ++i)
-			printf("%d\n", b[i]);
-      */
-	}
-	else {
-    
-		for (int i = 0; i < N; ++i) {
-      //printf("a[%d] = %d, b[%d] = %d)\n", i, a_output[i], i, b[i]);
-			if (a_output[i] != b[i]) {
-				printf("ERROR a[%d] != b[%d]  (a[i] = %d  -  b[i] = %d)\n", i,i, a_output[i],b[i]);
-        errors = true;
-				break;
-			}
-		}
-	}
-
-  if (!errors)
-    printf("SORTING AVVENUTO CON SUCCESSO!\n");
-
-  free(a);
-  free(a_output);
-	cudaFree(d_a);
-  cudaFree(d_b);
+  float average_time_CPU = total_time_CPU / C;
+  float average_time_GPU = total_time_GPU / C;
+  float milliseconds_difference = average_time_CPU - average_time_GPU;
+  printf("N = %d, C = %d\n", N, C);
+  printf("Average CPU time = %.5f (sec)\nAverage GPU time = %.5f (sec)\nAverage time difference = %.5f (sec)\n", 
+         average_time_CPU, average_time_GPU, milliseconds_difference);
+  printf("Average speedup = %.2f", average_time_CPU / average_time_GPU);
+	
 	exit(0);
 }
