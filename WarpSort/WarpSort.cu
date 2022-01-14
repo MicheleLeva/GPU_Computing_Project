@@ -611,7 +611,7 @@ __global__ void loadOutput(int * d_buffer, int * d_b, int l, int columnLength, i
 }
 
 
-/*******FUNZIONI DEL PROFESSORE*********/
+/*******GROSSI SEQUENTIAL BITONIC SORT*********/
 
 /*The parameter dir indicates the sorting direction, ASCENDING
  or DESCENDING; if (a[i] > a[j]) agrees with the direction,
@@ -716,9 +716,9 @@ int main(void) {
           break;
       }
   }
-  int s = BLOCKS / 16; //numero arbitrario ma funziona bene
+  int s = BLOCKS / 16; //aumentare l ci permette di diminuire s
 
-  printf ("\nStreaming multiprocessors (l) = %d, s = %d\n", l, s);
+  printf ("\nStreaming multiprocessors = %d, (l) = %d, s = %d\n", deviceProp.multiProcessorCount, l, s);
 	
   cudaEvent_t start_step, stop_step;
 	cudaEventCreate(&start_step);

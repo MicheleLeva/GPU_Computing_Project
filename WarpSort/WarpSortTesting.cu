@@ -9,7 +9,7 @@
 #define BLOCKS 1024*16*2
 #define T 64
 #define K 8
-#define C 100
+#define C 1 //numero di iterazioni
 
 //1024  2048  32768
 //preliminary step for step 3
