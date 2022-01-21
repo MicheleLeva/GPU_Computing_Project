@@ -6,9 +6,10 @@
 #include "../utils/common.h"
 
 #define THREADS 32
-#define BLOCKS 32768
+#define BLOCKS 1024*4
 #define T 64
 #define K 8
+//N è definito in funzione dei parametri THREADS e BLOCKS -> N = THREADS * BLOCKS * 4
 
 //preliminary step for step 3
 int * get_splitters (int * input, int s); 
@@ -32,7 +33,7 @@ __global__ void loadSegmentLengths(int * gpu_colIndexes, int * gpu_s_lengths, in
 
 __global__ void load_placeholders(int * s_lengths, int * d_buffer, int * a, int * s_indexesByColumn);
 
-__global__ void loadOutput(int * d_buffer, int * d_b, int l, int * columnLength, int global_index);
+__global__ void loadOutput(int * d_b, int * d_buffer, int l, int columnLength, int global_index);
 
 
 //utilities
@@ -42,6 +43,7 @@ __global__ void printMatrix(int * matrix, int * a, int rows, int columns);
 
 int get_length (int * array);
 
+//Fisher-Yates shuffle
 void shuffle(int *array, size_t n) {    
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -243,17 +245,19 @@ int * get_splitters (int * input, int s){
 __global__ void bitonic_sort_warp(int *keyin){
   unsigned int id = threadIdx.x + blockDim.x * blockIdx.x;
   unsigned int subseq = id / 32; //in quale sottosequenza dell'array siamo
-  unsigned int start = 128 * subseq; //primo elemento della sottosequenza da riordinare
+  unsigned int start = 128 * subseq; //primo elemento della sottosequenza da riordinare, usato come offset
 
-  int i = 0, j = 0;
-  int phase = 0, stage = 0;
-  int k_0 = 0, k_1 = 0;
-  int u = 0, index1 = 0, index2 = 0, p = 0, q = 0, m = 0, o = 0, um = 0, pm = 0;
+  int i = 0, j = 0; //indici di fase e stadio del bitonic sort poi usati per indici secondari
+  int phase = 0, stage = 0; //fase e stadio del bitonic sort
+  int k_0 = 0, k_1 = 0; //indici dei primi valori delle coppie da riordinare
+  int u = 0; //indice della sottosequenza simmetrica a cui il thread appartiene
+  int index1 = 0, index2 = 0; //indici della prima coppia da riordinare nello stadio
+  int p = 0, q = 0, m = 0, o = 0, um = 0, pm = 0; //indici secondari e offset usati per ricreare i pattern del bitonic sort
   float dim = 0;
 
   //if (threadIdx.x == 0) printf("bitonic_sort_warp\n");
 
-  //phase 0 to log(128)-1 
+  phase = 0; //phase da 0 a log(128)-1 (ovvero 6, quindi 7 fasi)
   for(i=2; i<128 ;i*=2){ 
     stage = 0;
 
@@ -369,25 +373,27 @@ __global__ void bitonic_sort_warp(int *keyin){
 //STEP 2: Merge all the subsequences produced in step 1 until the parallelism is insufficient.
 __global__ void bitonic_warp_merge(int * keyin, int * output, int offset){
   
+  //stessi indici dello step 1
   int j = 0;
   int stage = 0;
   int k_0 = 0;
   int u = 0, index1 = 0, p = 0;
   float dim = 0;
   
+  //buffer usato per il riordino
   __shared__ int buffer[T];
 
   //unsigned int id = threadIdx.x + blockDim.x * blockIdx.x;
   unsigned int subseq = blockIdx.x; //in quale warp siamo
-  unsigned int start = offset * subseq; //primo elemento della sottosequenza (A e B) da riordinare
+  unsigned int start = offset * subseq; //primo elemento dei segmenti (A e B) da riordinare
 
   //if (threadIdx.x == 0) printf("bitonic_warp_merge, offset = %d\n", offset);
 
-  int outIndex = start + threadIdx.x;
-  int iA = start, iB = start + (offset / 2);
-  int fA = start + (offset / 2), fB = start + offset;
-  int tA = iA + threadIdx.x, tB = iB + threadIdx.x;
-  bool compare;
+  int outIndex = start + threadIdx.x; //index da cui il warp partirà a scrivere in output
+  int iA = start, iB = start + (offset / 2); //primi indici dei segmenti A e B da riordinare
+  int fA = start + (offset / 2), fB = start + offset; //ultimi indici dei segmenti A e B da riordinare
+  int tA = iA + threadIdx.x, tB = iB + threadIdx.x; //indici di A e B di cui il thread corrente si occuperà
+  bool compare; //usato per decidere quali valori copiare sul buffer dai segmenti (da A o B)
 
   /*
   if (threadIdx.x == 0){
@@ -416,8 +422,8 @@ __global__ void bitonic_warp_merge(int * keyin, int * output, int offset){
     }*/
     
 
+    //bitonic sort basato sul merge sort dello step 1, il thread riordinerà solo due valori invece che 4
     stage = 0;
-    //bitonic based merge sort
     for(j = T/2; j>0; j/=2){ 
       
       dim = j * 2;
@@ -455,14 +461,16 @@ __global__ void bitonic_warp_merge(int * keyin, int * output, int offset){
              tA, fA, tB, fB);
     else
       output[outIndex] = buffer[threadIdx.x];
-    outIndex += THREADS;
+    outIndex += THREADS; //THREADS = 32
 
     //se A e B finiscono elementi prima dell'algoritmo, prosegui solo con la sottosequenza rimanente
     if (tA >= fA  && tB < fB )
       compare = false;
     if (tA < fA && tB >= fB)
       compare = true;
-    if (tA >= fA && tB >= fB){
+
+    //abbiamo raggiunto la fine delle sequenze da riordinare
+    if (tA >= fA && tB >= fB){ 
         
       //carico gli ultimi T/2 elementi del buffer sull'output
       output[outIndex] = buffer[T/2 + threadIdx.x];
@@ -501,10 +509,11 @@ __global__ void bitonic_warp_merge(int * keyin, int * output, int offset){
 //STEP 3:
 __global__ void loadSplitterMatrix(int * gpu_indexMatrix, int * splitters, int * d_a, int N, int l, int s, int numBlocksPerRow){
 
-  int rowLength = N / l;
-  int row = floor(blockIdx.x / numBlocksPerRow);
+  int rowLength = N / l; //lunghezza della riga
+  int row = floor(blockIdx.x / numBlocksPerRow); //riga su cui il thread lavora
 
-  int splitterIndex = (blockIdx.x - numBlocksPerRow * row) * blockDim.x + threadIdx.x;
+  //indice dello splitter di cui il thread si deve occupare
+  int splitterIndex = (blockIdx.x - numBlocksPerRow * row) * blockDim.x + threadIdx.x; 
 
   /*if (threadIdx.x == 0)
     printf("Segmento (%d, %d) = thread %d, blocco = %d\n", row, splitterIndex, threadIdx.x, blockIdx.x);
@@ -515,7 +524,7 @@ __global__ void loadSplitterMatrix(int * gpu_indexMatrix, int * splitters, int *
     
     //ricerca dell'indice corrispondente allo splitter
     
-    while (splitters[splitterIndex] > d_a[rowLength * row + i] && i < rowLength){
+    while (d_a[rowLength * row + i] < splitters[splitterIndex] && i < rowLength){
         i++;
     }
   }
@@ -525,7 +534,7 @@ __global__ void loadSplitterMatrix(int * gpu_indexMatrix, int * splitters, int *
   
 }
 
-//Used in step 4 to find the segment lengths
+//Usato nello step 4 per trovare le lunghezze dei segmenti della colonna e i loro indici su cui avverrà il merge
 __global__ void loadSegmentLengths(int * gpu_colIndexes, int * gpu_s_lengths, int * columnLength, int l, int s, int N, int * gpu_indexMatrix, int columnIndex){
   
   int rowIndex = threadIdx.x;
@@ -584,7 +593,7 @@ __global__ void load_placeholders(int * s_lengths, int * d_buffer, int * a, int 
     
 }
 
-__global__ void loadOutput(int * d_buffer, int * d_b, int l, int columnLength, int global_index){
+__global__ void loadOutput(int * d_b, int * d_buffer, int l, int columnLength, int global_index){
 
   unsigned int id = threadIdx.x + blockDim.x * blockIdx.x;
   int local_index = id - ( l * 128 - columnLength);
@@ -665,7 +674,7 @@ int main(void) {
 	cudaEventCreate(&start);
 	cudaEventCreate(&stop);
 
-	int N = THREADS*4*BLOCKS;
+	int N = THREADS*4*BLOCKS; //N è definito in funzione dei parametri THREADS e BLOCKS
   printf ("N = %d\n",N);
 	// check
 	if (!(N && !(N & (N - 1)))) {
@@ -690,12 +699,16 @@ int main(void) {
       b[i] = a [i];
   }
 
+  /***CPU SORT***/
+
 	// bitonic CPU
 	double cpu_time = seconds();
 
   bitonicSort(b, 0, N, 1);   // 1 means sort in ascending order
 
 	printf("CPU elapsed time: %.5f (sec)\n", seconds()-cpu_time);
+
+  /***GPU WARPSORT***/
 
 	// device mem copy
 	int *d_a, * d_b;
@@ -707,6 +720,7 @@ int main(void) {
 	dim3 blocks(BLOCKS, 1);   // Number of blocks
   dim3 threads(THREADS, 1); // Number of threads
 	
+  //calcolo di l e s in funzione dei SM del device
   cudaDeviceProp deviceProp;
 	cudaGetDeviceProperties(&deviceProp, 0);
   int l = deviceProp.multiProcessorCount; //numero di streaming multiprocessor della GPU
@@ -778,7 +792,7 @@ int main(void) {
 
   cudaEventRecord(start_step);
 
-  int maxOrderedSegmentSize;
+  int maxOrderedSegmentSize; //contatore per la lunghezza massima di un segmento ordinato, usato nel check successivo
   //finchè il parallelismo è insufficiente, ovvero finchè N / offset >= l
   //ad ogni warp merge si inverte input ed output raddoppiando la lunghezza del segmento che il warp deve ordinare
   for(int offset = THREADS * 8; N / offset >= l; offset *= 2){
@@ -848,7 +862,7 @@ int main(void) {
 
   //printf("j = %d, k = %d, numBlocksPerRow = %d\n", j, k, numBlocksPerRow);
 
-  //calcolo degli indici dei segmeenti di ogni riga e caricamento sulla matrice
+  //calcolo degli indici dei segmenti di ogni riga e caricamento sulla matrice
   loadSplitterMatrix<<<j, k>>>(gpu_indexMatrix, splitters, d_a, N, l, s, numBlocksPerRow);
 
   //printMatrix<<<1, 1>>>(gpu_indexMatrix, d_a, l, s);
@@ -870,37 +884,43 @@ int main(void) {
   int s_lengths[l], s_indexesByColumn[l];
   int global_s_lengths = 0;
 
-  //allocazione dell'array di output e caricamento dell'array da riordinare su GPU
+  //allocazione dell'array di output (in cpu e gpu) e caricamento dell'array da riordinare su GPU
   int *a_output;
   a_output = (int*) malloc(nBytes);
   CHECK(cudaMemcpy(d_b, a, nBytes, cudaMemcpyHostToDevice));
 
   //per ogni colonna vengono riordinate i segmenti e caricati sull'output
   for (int i = 0; i < s; i++){ 
-    int *cpu_buffer; //buffer on cpu used to build the first s segment with -1 placeholders
+    //buffer cpu usato per costruire i segmenti s della colonna con i -1 placeholders per raggiungere 128 valori
+    int *cpu_buffer; 
     cpu_buffer = (int*) malloc(l * 128 * sizeof(int));
-    int * columnLength = (int*) malloc(sizeof(int));
+
+    //lunghezza della colonna (allocata come array di un singolo elemento per essere usata su GPU)
+    int * columnLength = (int*) malloc(sizeof(int)); 
     columnLength[0] = 0;
 
+    //allocazioni dei buffer usati poi dal merge sort (come nello step 2 con d_a e d_b)
     int *d_buffer, *d_buffer_temp;
     CHECK(cudaMalloc((void**) &d_buffer, l * 128 * sizeof(int)));
     CHECK(cudaMalloc((void**) &d_buffer_temp, l * 128 * sizeof(int)));
 
+    //allocazione degli array per indici di colonna per ogni riga e per le lunghezze dei segmenti della colonna
     int * gpu_colIndexes, *gpu_s_lengths;
     CHECK(cudaMalloc((void**) &gpu_colIndexes, sizeof(int) * l));
     CHECK(cudaMalloc((void**) &gpu_s_lengths, sizeof(int) * l));
 
-    //copia delle lunghezze dei segmenti s in un buffer s_lengths e controllo che non sforino i 128 elementi
+    //copia delle lunghezze dei segmenti s sul buffer gpu_s_lengths e controllo che non sforino i 128 elementi
+    //copia inoltre dei loro indici sul buffer gpu_colIndexes
     loadSegmentLengths<<<1, l>>>(gpu_colIndexes, gpu_s_lengths, columnLength, l, s, N, gpu_indexMatrix, i);
- 
+
+    //copia delle somme delle lunghezze dei segmenti della colonna su cpu, e calcolo della lunghezza totale su columnLength
     CHECK(cudaMemcpy(s_lengths, gpu_s_lengths, sizeof(int) * l, cudaMemcpyDeviceToHost));
     for (int j = 0; j < l; j++) columnLength[0] += s_lengths[j];
+    
     //global_s_lengths += columnLength[0];
     
     //caricamento dei segmenti sul buffer d_buffer assieme ai placeholder -1
     load_placeholders<<<l, 128>>>(gpu_s_lengths, d_buffer, d_a, gpu_colIndexes);
-    
-    //CHECK(cudaMemcpy(d_buffer, cpu_buffer, l * 128 * sizeof(int), cudaMemcpyHostToDevice));
 
     //riordino di d_buffer (colonna) attraverso bitonic_warp_merge come in step 2
     blocks.x = l / 2;   // Number of blocks (warps)
@@ -918,9 +938,9 @@ int main(void) {
     
     //copia della colonna riordinata su output d_b
     if(!isAfirst){
-      loadOutput<<<l, 128>>>(d_buffer_temp, d_b, l, columnLength[0], global_index);
+      loadOutput<<<l, 128>>>(d_b, d_buffer_temp, l, columnLength[0], global_index);
     } else {
-      loadOutput<<<l, 128>>>(d_buffer, d_b, l, columnLength[0], global_index);
+      loadOutput<<<l, 128>>>(d_b, d_buffer, l, columnLength[0], global_index);
     }
     global_index += columnLength[0];
    
